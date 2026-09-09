@@ -20,6 +20,13 @@ import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidg
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
+import {
+  WP1_READONLY_PREFLIGHT_ANNOTATIONS,
+  WP1_READONLY_PREFLIGHT_TOOL_NAME,
+  WP1_READONLY_PREFLIGHT_REPOSITORY_ROOT,
+  validateWp1ReadonlyPreflight
+} from "./wp1ReadonlyPreflightOps.js";
+
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
 function errorText(error: unknown): string {
@@ -331,6 +338,7 @@ const MINIMAL_TOOL_NAMES = [
 ] as const;
 
 const STANDARD_TOOL_NAMES = [
+  WP1_READONLY_PREFLIGHT_TOOL_NAME,
   ...MINIMAL_TOOL_NAMES,
   "inspect_workspace",
   "tree",
@@ -344,6 +352,7 @@ const STANDARD_TOOL_NAMES = [
 ] as const;
 
 const FULL_TOOL_NAMES = [
+  WP1_READONLY_PREFLIGHT_TOOL_NAME,
   SUPERTOOL_NAME,
   "server_config",
   "codexpro_self_test",
@@ -387,6 +396,20 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "handoff_to_codex"
 ]);
 
+const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>([WP1_READONLY_PREFLIGHT_TOOL_NAME]);
+
+function rootCoversWp1Repository(value: string): boolean {
+  const root = path.win32.normalize(value).toLowerCase();
+  const target = path.win32.normalize(WP1_READONLY_PREFLIGHT_REPOSITORY_ROOT).toLowerCase();
+  const relative = path.win32.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.win32.sep}`) && !path.win32.isAbsolute(relative));
+}
+
+function wp1ReadonlyPreflightToolEnabled(config: CodexProConfig): boolean {
+  if (config.connectionTest || config.toolMode === "minimal") return false;
+  return [config.defaultRoot, ...config.allowedRoots].some(rootCoversWp1Repository);
+}
+
 function codexSessionToolNames(config: CodexProConfig): string[] {
   if (config.codexSessions === "off") return [];
   return config.codexSessions === "read"
@@ -401,6 +424,10 @@ function toolNamesForMode(config: CodexProConfig): string[] {
       : config.toolMode === "minimal"
         ? [...MINIMAL_TOOL_NAMES]
         : [...STANDARD_TOOL_NAMES];
+  if (!wp1ReadonlyPreflightToolEnabled(config)) {
+    const wp1Index = names.indexOf(WP1_READONLY_PREFLIGHT_TOOL_NAME);
+    if (wp1Index !== -1) names.splice(wp1Index, 1);
+  }
   if (config.bashMode === "off") {
     const bashIndex = names.indexOf("bash");
     if (bashIndex !== -1) names.splice(bashIndex, 1);
@@ -444,6 +471,7 @@ function registeredToolNames(server: McpServer): string[] {
 }
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
+  if (name === WP1_READONLY_PREFLIGHT_TOOL_NAME && !wp1ReadonlyPreflightToolEnabled(config)) return false;
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
   if (name === "bash" && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
@@ -955,7 +983,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const action = normalizeSupertoolAction(args.action);
-      const names = registeredToolNames(server).filter((name) => name !== SUPERTOOL_NAME);
+      const names = registeredToolNames(server).filter(
+        (name) => name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_TOOL_NAMES.has(name)
+      );
       if (action === "list_actions" || action === "help") {
         const text = [
           "# CodexPro Supertool",
@@ -984,6 +1014,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
 
       if (action === SUPERTOOL_NAME) {
         throw new CodexProError("codexpro cannot call itself. Use action=list_actions to inspect available wrapped actions.");
+      }
+
+      if (SUPERTOOL_EXCLUDED_TOOL_NAMES.has(action)) {
+        throw new CodexProError(`${action} is a direct-only MCP tool and is not available through codexpro.`);
       }
 
       const handler = registeredToolHandler(server, action);
@@ -1015,6 +1049,40 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         };
       }
       return result;
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    WP1_READONLY_PREFLIGHT_TOOL_NAME,
+    {
+      title: "AI Project Coordinator WP1 Scroll Preflight",
+      description:
+        "Pure local validation for the fixed AI Project Coordinator WP1 scroll-only authorization window. It performs no shell, subprocess, filesystem, git, network, SQLite, ApprovalGate, browser, or CDP operation and cannot execute Production work.",
+      inputSchema: {
+        task_id: z.string(),
+        execution_id: z.string(),
+        user_authorization_id: z.string(),
+        user_authorized_at: z.string(),
+        user_expires_at: z.string()
+      },
+      annotations: WP1_READONLY_PREFLIGHT_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Validating WP1 read-only preflight...",
+        "openai/toolInvocation/invoked": "WP1 read-only preflight validation complete"
+      }
+    },
+    async (args) => {
+      const result = validateWp1ReadonlyPreflight({
+        task_id: args.task_id,
+        execution_id: args.execution_id,
+        user_authorization_id: args.user_authorization_id,
+        user_authorized_at: args.user_authorized_at,
+        user_expires_at: args.user_expires_at
+      });
+      const payload = { ready: result.ready, reason: result.reason };
+      return textResult(JSON.stringify(payload), payload);
     }
   );
 
