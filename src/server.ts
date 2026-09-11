@@ -19,6 +19,7 @@ import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { DEDICATED_CHROME_CONFIRM, runDedicatedChromeStart } from "./dedicatedChromeOps.js";
 
 import {
   WP1_READONLY_PREFLIGHT_ANNOTATIONS,
@@ -338,6 +339,7 @@ const MINIMAL_TOOL_NAMES = [
 ] as const;
 
 const STANDARD_TOOL_NAMES = [
+  "start_dedicated_chrome",
   WP1_READONLY_PREFLIGHT_TOOL_NAME,
   ...MINIMAL_TOOL_NAMES,
   "inspect_workspace",
@@ -352,6 +354,7 @@ const STANDARD_TOOL_NAMES = [
 ] as const;
 
 const FULL_TOOL_NAMES = [
+  "start_dedicated_chrome",
   WP1_READONLY_PREFLIGHT_TOOL_NAME,
   SUPERTOOL_NAME,
   "server_config",
@@ -384,6 +387,7 @@ const FULL_TOOL_NAMES = [
 ] as const;
 
 const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
+  "start_dedicated_chrome",
   SUPERTOOL_NAME,
   "codexpro_self_test",
   "write",
@@ -397,6 +401,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
 ]);
 
 const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>([WP1_READONLY_PREFLIGHT_TOOL_NAME]);
+const EXPLICIT_DIRECT_ONLY_TOOLS = new Set<string>(["start_dedicated_chrome"]);
 
 function rootCoversWp1Repository(value: string): boolean {
   const root = path.win32.normalize(value).toLowerCase();
@@ -953,6 +958,7 @@ const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, des
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
+const LOCAL_PROCESS_START_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 
 export function createCodexProServer(config: CodexProConfig): McpServer {
   const workspaces = new WorkspaceManager(config);
@@ -984,7 +990,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     async (args) => {
       const action = normalizeSupertoolAction(args.action);
       const names = registeredToolNames(server).filter(
-        (name) => name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_TOOL_NAMES.has(name)
+        (name) => name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_TOOL_NAMES.has(name) && !EXPLICIT_DIRECT_ONLY_TOOLS.has(name)
       );
       if (action === "list_actions" || action === "help") {
         const text = [
@@ -1016,7 +1022,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         throw new CodexProError("codexpro cannot call itself. Use action=list_actions to inspect available wrapped actions.");
       }
 
-      if (SUPERTOOL_EXCLUDED_TOOL_NAMES.has(action)) {
+      if (SUPERTOOL_EXCLUDED_TOOL_NAMES.has(action) || EXPLICIT_DIRECT_ONLY_TOOLS.has(action)) {
         throw new CodexProError(`${action} is a direct-only MCP tool and is not available through codexpro.`);
       }
 
@@ -1083,6 +1089,31 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       });
       const payload = { ready: result.ready, reason: result.reason };
       return textResult(JSON.stringify(payload), payload);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "start_dedicated_chrome",
+    {
+      title: "Start Dedicated Chrome",
+      description: "Start the canonical AI Project Coordinator Chrome process only. Uses fixed executable C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe, fixed profile C:\\CoordinatorRuntime\\browser-profile, and loopback CDP 127.0.0.1:9223. Requires exact confirmation START_DEDICATED_CHROME_CDP. dry_run defaults to true. An already-healthy loopback CDP returns without launching a duplicate process; a fresh launch is attempted at most once and succeeds only after CDP readiness is confirmed. No arbitrary path/args, navigation, CDP commands, stop/restart/kill, or automatic retry are exposed.",
+      inputSchema: {
+        confirm: z.string().describe(`Exact confirmation string: ${DEDICATED_CHROME_CONFIRM}.`),
+        dry_run: z.boolean().optional().describe("Default: true. Validate and return the exact canonical Chrome start plan without launching Chrome.")
+      },
+      annotations: LOCAL_PROCESS_START_ANNOTATIONS
+    },
+    async (args) => {
+      const result = await runDedicatedChromeStart({
+        confirm: String(args.confirm ?? ""),
+        dryRun: args.dry_run !== false
+      });
+      return textResult(
+        `# Dedicated Chrome Start\n\nStatus: ${result.status}\nExecutable: ${result.executable}\nProfile: ${result.profile}\nCDP: ${result.cdpEndpoint}\nCDP ready: ${String(result.cdpReady)}\nLaunch attempted: ${String(result.launchAttempted)}\nLaunch count: ${result.launchCount}\nArgs: ${result.args.join(" ")}`,
+        { ...result }
+      );
     }
   );
 

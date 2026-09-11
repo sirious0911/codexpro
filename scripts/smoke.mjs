@@ -1190,7 +1190,8 @@ async function assertToolMode(mode, expected, hidden, extraEnv = {}) {
     if (names.includes(hiddenName)) throw new Error(`${mode || 'default'} mode should hide ${hiddenName}; got ${names.join(', ')}`);
   }
   const superActions = await modeClient.request('tools/call', { name: 'codexpro', arguments: { action: 'list_actions' } });
-  const expectedActions = names.filter((name) => name !== 'codexpro').sort();
+  const directOnlyActions = new Set(['codexpro_controlled_handover', 'shutdown_windows', 'reboot_windows', 'start_dedicated_chrome']);
+  const expectedActions = names.filter((name) => name !== 'codexpro' && !directOnlyActions.has(name)).sort();
   const actualActions = [...superActions.structuredContent.actions].sort();
   if (JSON.stringify(actualActions) !== JSON.stringify(expectedActions)) {
     throw new Error(`${mode || 'default'} supertool actions did not match registered tools: expected ${expectedActions.join(', ')} got ${actualActions.join(', ')}`);
