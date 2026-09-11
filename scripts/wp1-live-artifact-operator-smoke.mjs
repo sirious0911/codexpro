@@ -96,7 +96,7 @@ async function testPreflightMetadataOnly() {
     const result = await preflight({ roots: value.roots });
     const serialized = JSON.stringify(result);
     check(result.ready && result.reason === "PREFLIGHT_READY", "preflight must be ready");
-    check(result.candidate_files.length === 4 && result.live_files.length === 4, "preflight must report exact4");
+    check(result.candidate_files.length === 10 && result.live_files.length === 10, "preflight must report exact10");
     check(result.candidate_files.every((item) => item.exists && item.size > 0 && /^[0-9a-f]{64}$/.test(item.sha256)), "candidate metadata must be bounded");
     check(!serialized.includes("PRIVATE-CONTENT"), "preflight must not expose contents");
     check(beforeBackup === false && await exists(value.roots.backupBase) === false, "preflight must write nothing");
@@ -236,7 +236,13 @@ async function testCliAndStaticBoundaries() {
   const source = await readFile(scriptPath, "utf8");
   check(!/node:(?:child_process|net|http|https)|\b(?:spawn|execFile|execSync)\s*\(/.test(source), "operator must not invoke process or network surfaces");
   check(source.includes(PRODUCTION_ROOTS.candidate) && source.includes(PRODUCTION_ROOTS.live), "production roots must be fixed in source");
-  check(ARTIFACTS.length === 4 && ARTIFACTS.at(-1) === "dist/server.js", "allowlist must be exact4 with server last");
+  check(
+    ARTIFACTS.length === 10 &&
+      ARTIFACTS[6] === "dist/dedicatedChromeOps.js" &&
+      ARTIFACTS[7] === "dist/dedicatedChromeOps.js.map" &&
+      ARTIFACTS.at(-1) === "dist/server.js",
+    "allowlist must be exact10 with dedicated Chrome artifacts before server-last activation",
+  );
 }
 
 await testPreflightMetadataOnly();

@@ -17,6 +17,12 @@ import { fileURLToPath } from "node:url";
 export const ARTIFACTS = Object.freeze([
   "dist/wp1ReadonlyPreflightOps.js",
   "dist/wp1ReadonlyPreflightOps.js.map",
+  "dist/powerOps.js",
+  "dist/powerOps.js.map",
+  "dist/controlledHandoverOps.js",
+  "dist/controlledHandoverOps.js.map",
+  "dist/dedicatedChromeOps.js",
+  "dist/dedicatedChromeOps.js.map",
   "dist/server.js.map",
   "dist/server.js",
 ]);
