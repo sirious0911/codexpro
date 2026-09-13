@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.js";
+import { localCapabilityModeFrom, type LocalCapabilityMode } from "./localCapabilityPolicy.js";
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
@@ -26,6 +27,7 @@ export interface CodexProConfig {
   codexDir: string;
   writeMode: WriteMode;
   toolMode: ToolMode;
+  localCapabilityMode: LocalCapabilityMode;
   inheritEnv: boolean;
   maxReadBytes: number;
   maxWriteBytes: number;
@@ -277,6 +279,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
         : undefined;
   const writeArg = typeof args.write === "string" ? args.write : undefined;
   const toolModeArg = typeof args["tool-mode"] === "string" ? args["tool-mode"] : undefined;
+  const localCapabilityArg = typeof args["local-capabilities"] === "string" ? args["local-capabilities"] : undefined;
   const widgetDomainArg = typeof args["widget-domain"] === "string" ? args["widget-domain"] : undefined;
   const toolCardsArg =
     args["tool-cards"] === true
@@ -321,6 +324,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     codexDir: expandHome(codexDirArg || process.env.CODEXPRO_CODEX_DIR || path.join(os.homedir(), ".codex")),
     writeMode: writeModeFrom(writeArg ?? process.env.CODEXPRO_WRITE_MODE),
     toolMode: toolModeFrom(toolModeArg ?? process.env.CODEXPRO_TOOL_MODE),
+    localCapabilityMode: localCapabilityModeFrom(localCapabilityArg ?? process.env.CODEXPRO_LOCAL_CAPABILITIES),
     inheritEnv: process.env.CODEXPRO_INHERIT_ENV === "1",
     maxReadBytes: numberFrom(process.env.CODEXPRO_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
     maxWriteBytes: numberFrom(process.env.CODEXPRO_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),

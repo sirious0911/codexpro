@@ -26,6 +26,17 @@ import {
   WP1_READONLY_PREFLIGHT_REPOSITORY_ROOT,
   validateWp1ReadonlyPreflight
 } from "./wp1ReadonlyPreflightOps.js";
+import {
+  LOCAL_CAPABILITY_DIRECT_ONLY_TOOL_NAMES,
+  LOCAL_CAPABILITY_TOOL_ANNOTATIONS,
+  isLocalCapabilityToolName,
+  localCapabilityToolEnabled,
+  localCapabilityToolNamesForPolicy
+} from "./localCapabilityPolicy.js";
+import { runLocalRuntimeProbeOperator } from "./localRuntimeProbeOperator.js";
+import { runWindowsSystemSnapshotOperator } from "./windowsSystemSnapshotOperator.js";
+import { runWindowsPowerOperator } from "./windowsPowerOperator.js";
+import { runWindowsDesktopUiLiveOperator } from "./windowsDesktopUiLiveOperator.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -396,7 +407,10 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "handoff_to_codex"
 ]);
 
-const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>([WP1_READONLY_PREFLIGHT_TOOL_NAME]);
+const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>([
+  WP1_READONLY_PREFLIGHT_TOOL_NAME,
+  ...LOCAL_CAPABILITY_DIRECT_ONLY_TOOL_NAMES
+]);
 
 function rootCoversWp1Repository(value: string): boolean {
   const root = path.win32.normalize(value).toLowerCase();
@@ -452,6 +466,9 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   for (const name of codexSessionToolNames(config)) {
     if (!names.includes(name)) names.push(name);
   }
+  for (const name of localCapabilityToolNamesForPolicy(config)) {
+    if (!names.includes(name)) names.push(name);
+  }
   return names;
 }
 
@@ -471,6 +488,7 @@ function registeredToolNames(server: McpServer): string[] {
 }
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
+  if (isLocalCapabilityToolName(name)) return localCapabilityToolEnabled(config, name);
   if (name === WP1_READONLY_PREFLIGHT_TOOL_NAME && !wp1ReadonlyPreflightToolEnabled(config)) return false;
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
   if (name === "bash" && config.bashMode === "off") return false;
@@ -531,7 +549,10 @@ function serverInstructions(config: CodexProConfig): string {
         ? `8. Bash session label for this server is "${config.bashSessionId}".`
         : "",
     "",
-    `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}.`
+    `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}, local_capabilities=${config.localCapabilityMode}.`,
+    config.localCapabilityMode !== "off"
+      ? "Local capability tools are first-class direct-only tools and are never routed through the codexpro supertool."
+      : ""
   ].filter(Boolean).join("\n");
 }
 
@@ -1089,6 +1110,113 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   registerCodexTool(
     config,
     server,
+    "local_runtime_probe",
+    {
+      title: "Local Runtime Probe",
+      description: "Probe only the fixed local CodexPro runtime endpoint using the existing bounded local runtime operator.",
+      inputSchema: {},
+      annotations: LOCAL_CAPABILITY_TOOL_ANNOTATIONS.local_runtime_probe
+    },
+    async () => {
+      const result = await runLocalRuntimeProbeOperator();
+      return textResult(JSON.stringify(result.payload), { ...result.payload });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "windows_system_snapshot",
+    {
+      title: "Windows System Snapshot",
+      description: "Read only the existing bounded Windows system snapshot fields with no user, process, network, or private data.",
+      inputSchema: {},
+      annotations: LOCAL_CAPABILITY_TOOL_ANNOTATIONS.windows_system_snapshot
+    },
+    async () => {
+      const result = runWindowsSystemSnapshotOperator();
+      return textResult(JSON.stringify(result.payload), { ...result.payload });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "windows_power_action",
+    {
+      title: "Windows Power Action",
+      description: "Run the existing bounded Windows shutdown/reboot operator. Requires exact confirmation and an explicit dry_run boolean.",
+      inputSchema: {
+        action: z.enum(["shutdown", "reboot"]),
+        confirm: z.string(),
+        dry_run: z.boolean()
+      },
+      annotations: LOCAL_CAPABILITY_TOOL_ANNOTATIONS.windows_power_action
+    },
+    async (args) => {
+      const result = runWindowsPowerOperator({
+        action: args.action,
+        confirm: args.confirm,
+        dry_run: args.dry_run
+      });
+      return textResult(JSON.stringify(result), { ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "windows_desktop_ui",
+    {
+      title: "Windows Desktop UI",
+      description: "Run the existing bounded Windows desktop UI operator with an explicit dry_run boolean and the fixed Phase6 action schema.",
+      inputSchema: {
+        actions: z.array(
+          z.discriminatedUnion("type", [
+            z.object({
+              type: z.literal("POINTER_MOVE"),
+              x: z.number().int().min(0).max(65535),
+              y: z.number().int().min(0).max(65535)
+            }).strict(),
+            z.object({
+              type: z.literal("POINTER_CLICK"),
+              button: z.enum(["left", "right"])
+            }).strict(),
+            z.object({
+              type: z.literal("KEY_PRESS"),
+              key: z.enum([
+                "ENTER",
+                "ESCAPE",
+                "TAB",
+                "BACKSPACE",
+                "ARROW_UP",
+                "ARROW_DOWN",
+                "ARROW_LEFT",
+                "ARROW_RIGHT"
+              ])
+            }).strict(),
+            z.object({
+              type: z.literal("TYPE_TEXT"),
+              text: z.string().min(1).max(256).regex(/^[\x20-\x7E]+$/)
+            }).strict()
+          ])
+        ).min(1).max(16),
+        dry_run: z.boolean()
+      },
+      annotations: LOCAL_CAPABILITY_TOOL_ANNOTATIONS.windows_desktop_ui
+    },
+    async (args) => {
+      const result = runWindowsDesktopUiLiveOperator({
+        actions: args.actions,
+        dry_run: args.dry_run
+      });
+      return textResult(JSON.stringify(result), { ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
     "server_config",
     {
       title: "Server Config",
@@ -1117,6 +1245,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         codexDir: config.codexDir,
         writeMode: config.writeMode,
         toolMode: config.toolMode,
+        localCapabilityMode: config.localCapabilityMode,
         toolCards: config.toolCards,
         connectionTest: config.connectionTest,
         analysisEnabled: config.analysisEnabled,
