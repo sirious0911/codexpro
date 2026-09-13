@@ -1172,7 +1172,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "shutdown_windows",
     {
       title: "Shutdown Windows",
-      description: "Shut down this Windows PC through shutdown.exe. Requires exact confirmation SHUTDOWN_WINDOWS. dry_run defaults to true. Never forces applications to close and must not be retried automatically after dispatch.",
+      description: "Shut down this Windows PC through shutdown.exe. Requires exact confirmation SHUTDOWN_WINDOWS. dry_run defaults to true. Uses the normal non-force shutdown first; only Windows error 1271 (machine locked) permits exactly one /f fallback. Other failures are never retried automatically.",
       inputSchema: {
         confirm: z.string().describe("Exact confirmation string: SHUTDOWN_WINDOWS."),
         dry_run: z.boolean().optional().describe("Default: true. Validate and return the exact shutdown plan without executing it.")
@@ -1185,7 +1185,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         dryRun: args.dry_run !== false
       });
       return textResult(
-        `# Windows Shutdown\n\nStatus: ${result.status}\nExecutable: ${result.executable}\nArgs: ${result.args.join(" ")}`,
+        `# Windows Shutdown\n\nStatus: ${result.status}\nExecutable: ${result.executable}\nArgs: ${result.args.join(" ")}\nDispatch attempts: ${result.dispatchAttempts}\nLocked force fallback used: ${String(result.lockedForceFallbackUsed)}`,
         { ...result }
       );
     }
@@ -1197,7 +1197,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "reboot_windows",
     {
       title: "Reboot Windows",
-      description: "Reboot this Windows PC through shutdown.exe. Requires exact confirmation REBOOT_WINDOWS. dry_run defaults to true. Never forces applications to close and must not be retried automatically after dispatch.",
+      description: "Reboot this Windows PC through shutdown.exe. Requires exact confirmation REBOOT_WINDOWS. dry_run defaults to true. Uses the normal non-force reboot first; only Windows error 1271 (machine locked) permits exactly one /f fallback. Other failures are never retried automatically.",
       inputSchema: {
         confirm: z.string().describe("Exact confirmation string: REBOOT_WINDOWS."),
         dry_run: z.boolean().optional().describe("Default: true. Validate and return the exact reboot plan without executing it.")
@@ -1210,7 +1210,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         dryRun: args.dry_run !== false
       });
       return textResult(
-        `# Windows Reboot\n\nStatus: ${result.status}\nExecutable: ${result.executable}\nArgs: ${result.args.join(" ")}`,
+        `# Windows Reboot\n\nStatus: ${result.status}\nExecutable: ${result.executable}\nArgs: ${result.args.join(" ")}\nDispatch attempts: ${result.dispatchAttempts}\nLocked force fallback used: ${String(result.lockedForceFallbackUsed)}`,
         { ...result }
       );
     }
@@ -1279,7 +1279,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "windows_power_action",
     {
       title: "Windows Power Action",
-      description: "Run the existing bounded Windows shutdown/reboot operator. Requires exact confirmation and an explicit dry_run boolean.",
+      description: "Run the existing bounded Windows shutdown/reboot operator. Requires exact confirmation and an explicit dry_run boolean. Normal non-force dispatch is attempted first; only Windows error 1271 (machine locked) permits exactly one /f fallback.",
       inputSchema: {
         action: z.enum(["shutdown", "reboot"]),
         confirm: z.string(),

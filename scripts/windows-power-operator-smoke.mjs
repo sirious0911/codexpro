@@ -9,6 +9,9 @@ import {
 import {
   runWindowsPowerOperator
 } from "../src/windowsPowerOperator.ts";
+import {
+  runWindowsPowerAction
+} from "../src/powerOps.ts";
 
 assert.deepEqual(WINDOWS_POWER_CONFIRMATIONS, {
   shutdown: "SHUTDOWN_WINDOWS",
@@ -50,7 +53,9 @@ assert.deepEqual(dispatchWindowsPowerPlan(shutdownPlan, {
     throw new Error("dry-run must not dispatch");
   }
 }), {
-  status: "DRY_RUN"
+  status: "DRY_RUN",
+  dispatch_attempts: 0,
+  locked_force_fallback_used: false
 });
 
 assert.throws(
@@ -107,6 +112,81 @@ assert.throws(
   assert.equal(calls, 1);
   assert.equal(result.status, "DISPATCHED");
   assert.equal(result.plan.dry_run, false);
+  assert.equal(result.dispatch_attempts, 1);
+  assert.equal(result.locked_force_fallback_used, false);
+}
+
+{
+  const calls = [];
+  const result = runWindowsPowerOperator(
+    {
+      action: "shutdown",
+      confirm: "SHUTDOWN_WINDOWS",
+      dry_run: false
+    },
+    {
+      platform: "win32",
+      dispatch_runtime: {
+        spawn: (executable, args, options) => {
+          calls.push({ executable, args: [...args], options });
+          return { status: calls.length === 1 ? 1271 : 0 };
+        }
+      }
+    }
+  );
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].args, ["/s", "/t", "0"]);
+  assert.deepEqual(calls[1].args, ["/s", "/t", "0", "/f"]);
+  assert.equal(result.status, "DISPATCHED");
+  assert.equal(result.dispatch_attempts, 2);
+  assert.equal(result.locked_force_fallback_used, true);
+}
+
+{
+  const calls = [];
+  const result = runWindowsPowerAction(
+    "reboot",
+    {
+      confirm: "REBOOT_WINDOWS",
+      dryRun: false
+    },
+    {
+      spawn: (executable, args, options) => {
+        calls.push({ executable, args: [...args], options });
+        return { status: calls.length === 1 ? 1271 : 0 };
+      }
+    }
+  );
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].args, ["/r", "/t", "0"]);
+  assert.deepEqual(calls[1].args, ["/r", "/t", "0", "/f"]);
+  assert.equal(result.status, "DISPATCHED");
+  assert.equal(result.dispatchAttempts, 2);
+  assert.equal(result.lockedForceFallbackUsed, true);
+}
+
+{
+  let calls = 0;
+  assert.throws(
+    () =>
+      runWindowsPowerAction(
+        "shutdown",
+        {
+          confirm: "SHUTDOWN_WINDOWS",
+          dryRun: false
+        },
+        {
+          spawn: () => {
+            calls += 1;
+            return { status: 5 };
+          }
+        }
+      ),
+    /non-zero status: 5/
+  );
+  assert.equal(calls, 1);
 }
 
 {

@@ -17,6 +17,8 @@ export interface WindowsPowerOperatorInput {
 export interface WindowsPowerOperatorResult {
   plan: WindowsPowerPlan;
   status: "DRY_RUN" | "DISPATCHED";
+  dispatch_attempts: 0 | 1 | 2;
+  locked_force_fallback_used: boolean;
 }
 
 function validateOperatorInput(input: unknown): WindowsPowerOperatorInput {
@@ -62,7 +64,9 @@ export function runWindowsPowerOperator(
 
   return {
     plan,
-    status: dispatched.status
+    status: dispatched.status,
+    dispatch_attempts: dispatched.dispatch_attempts,
+    locked_force_fallback_used: dispatched.locked_force_fallback_used
   };
 }
 

@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
 
 export type WindowsPowerAction = "shutdown" | "reboot";
+export type WindowsPowerArgs =
+  | ["/s" | "/r", "/t", "0"]
+  | ["/s" | "/r", "/t", "0", "/f"];
 
 export const WINDOWS_POWER_CONFIRM = Object.freeze({
   shutdown: "SHUTDOWN_WINDOWS",
@@ -19,6 +22,39 @@ export interface WindowsPowerPlan {
   confirmation: string;
   dryRun: boolean;
 }
+
+export interface WindowsPowerRuntime {
+  spawn(
+    executable: "shutdown.exe",
+    args: WindowsPowerArgs,
+    options: Readonly<{
+      windowsHide: true;
+      stdio: "ignore";
+      timeout: 5000;
+    }>
+  ): {
+    status: number | null;
+    error?: unknown;
+  };
+}
+
+export const defaultWindowsPowerRuntime: WindowsPowerRuntime = Object.freeze({
+  spawn(
+    executable: "shutdown.exe",
+    args: WindowsPowerArgs,
+    options: Readonly<{
+      windowsHide: true;
+      stdio: "ignore";
+      timeout: 5000;
+    }>
+  ) {
+    const result = spawnSync(executable, args, options);
+    return {
+      status: result.status,
+      error: result.error
+    };
+  }
+});
 
 export function buildWindowsPowerPlan(
   action: WindowsPowerAction,
@@ -45,21 +81,55 @@ export function buildWindowsPowerPlan(
 
 export function runWindowsPowerAction(
   action: WindowsPowerAction,
-  options: WindowsPowerOptions
-): WindowsPowerPlan & { status: "DRY_RUN" | "DISPATCHED" } {
+  options: WindowsPowerOptions,
+  runtime: WindowsPowerRuntime = defaultWindowsPowerRuntime
+): WindowsPowerPlan & {
+  status: "DRY_RUN" | "DISPATCHED";
+  dispatchAttempts: 0 | 1 | 2;
+  lockedForceFallbackUsed: boolean;
+} {
   const plan = buildWindowsPowerPlan(action, options);
-  if (plan.dryRun) return { ...plan, status: "DRY_RUN" };
-
-  const result = spawnSync(plan.executable, plan.args, {
-    windowsHide: true,
-    stdio: "ignore",
-    timeout: 5000
-  });
-
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`shutdown.exe returned non-zero status: ${String(result.status)}`);
+  if (plan.dryRun) {
+    return {
+      ...plan,
+      status: "DRY_RUN",
+      dispatchAttempts: 0,
+      lockedForceFallbackUsed: false
+    };
   }
 
-  return { ...plan, status: "DISPATCHED" };
+  const spawnOptions = Object.freeze({
+    windowsHide: true as const,
+    stdio: "ignore" as const,
+    timeout: 5000 as const
+  });
+
+  const first = runtime.spawn(plan.executable, plan.args, spawnOptions);
+  if (first.error !== undefined) throw first.error;
+  if (first.status === 0) {
+    return {
+      ...plan,
+      status: "DISPATCHED",
+      dispatchAttempts: 1,
+      lockedForceFallbackUsed: false
+    };
+  }
+
+  if (first.status !== 1271) {
+    throw new Error(`shutdown.exe returned non-zero status: ${String(first.status)}`);
+  }
+
+  const forcedArgs: WindowsPowerArgs = [...plan.args, "/f"];
+  const forced = runtime.spawn(plan.executable, forcedArgs, spawnOptions);
+  if (forced.error !== undefined) throw forced.error;
+  if (forced.status !== 0) {
+    throw new Error(`shutdown.exe locked-force fallback returned non-zero status: ${String(forced.status)}`);
+  }
+
+  return {
+    ...plan,
+    status: "DISPATCHED",
+    dispatchAttempts: 2,
+    lockedForceFallbackUsed: true
+  };
 }
