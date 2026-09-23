@@ -98,6 +98,7 @@ function startFixtureServer(payload, options = {}) {
 }
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-import-smoke-'));
+const workWindowHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-import-smoke-home-'));
 const {
   assertSafeImportUrl,
   detectMimeType,
@@ -227,6 +228,7 @@ try {
         CODEXPRO_ROOT: root,
         CODEXPRO_ALLOWED_ROOTS: root,
         CODEXPRO_WRITE_MODE: 'workspace',
+        CODEXPRO_HOME: workWindowHome,
         CODEXPRO_IMPORT_ALLOW_LOOPBACK: '1',
         CODEXPRO_ALLOW_NO_HTTP_TOKEN: '1'
       }
@@ -256,10 +258,18 @@ try {
         name: 'open_current_workspace',
         arguments: { include_tree: false }
       });
+      const startedWindow = await client.request('tools/call', {
+        name: 'start_work_window',
+        arguments: { workspace_id: opened.structuredContent.workspace_id, session_binding: 'import-smoke' }
+      });
+      if (startedWindow.isError || startedWindow.structuredContent?.state !== 'ACTIVE') {
+        throw new Error(`start_work_window failed for import smoke: ${JSON.stringify(startedWindow)}`);
+      }
       const viaTool = await client.request('tools/call', {
         name: 'import_file',
         arguments: {
           workspace_id: opened.structuredContent.workspace_id,
+          work_window_id: startedWindow.structuredContent.work_window_id,
           file: {
             download_url: fixture.url,
             file_id: 'file_smoke_tool',
@@ -288,4 +298,5 @@ try {
   console.log('✓ import smoke test passed');
 } finally {
   await fs.rm(root, { recursive: true, force: true });
+  await fs.rm(workWindowHome, { recursive: true, force: true });
 }

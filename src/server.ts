@@ -43,6 +43,7 @@ import { runLocalRuntimeProbeOperator } from "./localRuntimeProbeOperator.js";
 import { runWindowsSystemSnapshotOperator } from "./windowsSystemSnapshotOperator.js";
 import { runWindowsPowerOperator } from "./windowsPowerOperator.js";
 import { runWindowsDesktopUiLiveOperator } from "./windowsDesktopUiLiveOperator.js";
+import { WorkWindowGuard } from "./workWindowGuard.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -258,6 +259,20 @@ const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   codex_handoff: "handoff_to_codex"
 };
 
+const WORK_WINDOW_TOOL_NAMES = [
+  "start_work_window",
+  "work_window_status",
+  "list_active_work_windows",
+  "checkpoint_work_window",
+  "stop_work_window"
+] as const;
+
+const WORK_WINDOW_STATE_MUTATION_TOOL_NAMES = [
+  "start_work_window",
+  "checkpoint_work_window",
+  "stop_work_window"
+] as const;
+
 const registeredToolHandlersByServer = new WeakMap<object, Map<string, CodexToolHandler>>();
 
 function rememberRegisteredToolHandler(server: McpServer, name: string, handler: CodexToolHandler): void {
@@ -351,7 +366,8 @@ const MINIMAL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
-  "show_changes"
+  "show_changes",
+  ...WORK_WINDOW_TOOL_NAMES
 ] as const;
 
 const STANDARD_TOOL_NAMES = [
@@ -403,10 +419,18 @@ const FULL_TOOL_NAMES = [
   "export_pro_context",
   "handoff_to_agent",
   "handoff_to_codex",
+  ...WORK_WINDOW_TOOL_NAMES,
   "shutdown_windows",
   "reboot_windows",
   "start_dedicated_chrome"
 ] as const;
+
+const LEGACY_DIRECT_ONLY_TOOL_NAMES = new Set<string>([
+  CODEXPRO_CONTROLLED_HANDOVER_TOOL_NAME,
+  "shutdown_windows",
+  "reboot_windows",
+  "start_dedicated_chrome"
+]);
 
 const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   SUPERTOOL_NAME,
@@ -418,19 +442,14 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "bash",
   "export_pro_context",
   "handoff_to_agent",
-  "handoff_to_codex"
+  "handoff_to_codex",
+  ...LEGACY_DIRECT_ONLY_TOOL_NAMES,
+  ...WORK_WINDOW_STATE_MUTATION_TOOL_NAMES
 ]);
 
 const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>([
   WP1_READONLY_PREFLIGHT_TOOL_NAME,
   ...LOCAL_CAPABILITY_DIRECT_ONLY_TOOL_NAMES
-]);
-
-const LEGACY_DIRECT_ONLY_TOOL_NAMES = new Set<string>([
-  CODEXPRO_CONTROLLED_HANDOVER_TOOL_NAME,
-  "shutdown_windows",
-  "reboot_windows",
-  "start_dedicated_chrome"
 ]);
 
 const COMBINED_DIRECT_ONLY_TOOL_NAMES = new Set<string>([
@@ -555,6 +574,9 @@ function serverInstructions(config: CodexProConfig): string {
     config.bashMode === "off"
       ? "5. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
       : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
+  const workWindowInstruction = config.connectionTest
+    ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, or stop Work Windows."
+    : "6. For a new user-authorized substantive work/resume request, call start_work_window once before write/edit/apply_patch/import_file/bash and pass that explicit work_window_id to every guarded operation. A Work Window is ACTIVE for 27 minutes, DRAINING until 30 minutes, then EXPIRED. Never auto-renew or self-start a replacement; only a new user request may authorize a new Work Window.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
@@ -565,7 +587,8 @@ function serverInstructions(config: CodexProConfig): string {
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
     bashInstruction,
-    "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
+    workWindowInstruction,
+    "7. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -1005,6 +1028,7 @@ const LOCAL_PROCESS_START_ANNOTATIONS = { readOnlyHint: false, openWorldHint: fa
 
 export function createCodexProServer(config: CodexProConfig): McpServer {
   const workspaces = new WorkspaceManager(config);
+  const workWindowGuard = new WorkWindowGuard();
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
@@ -2150,12 +2174,153 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   registerCodexTool(
     config,
     server,
+    "start_work_window",
+    {
+      title: "Start Work Window",
+      description:
+        "Start one fixed 30-minute Work Window for the current workspace. Call this only at the beginning of a new user-authorized substantive work/resume request. Never use it to auto-renew or self-renew an existing, draining, or expired window.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the selected workspace."),
+        session_binding: z.string().max(128).optional().describe("Optional non-authoritative caller session label. HOST_ID + WORK_WINDOW_ID remain authoritative.")
+      },
+      annotations: HANDOFF_WRITE_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const status = await workWindowGuard.start(workspace, { sessionBinding: args.session_binding });
+      const text = [
+        "# Start Work Window",
+        "",
+        `Work window: ${status.work_window_id}`,
+        `State: ${status.state}`,
+        `Drain at: ${status.drain_at_kst}`,
+        `Deadline: ${status.deadline_kst}`,
+        "",
+        "Pass this exact work_window_id to write/edit/apply_patch/import_file/bash. Do not auto-renew it; a new Work Window requires a new user-authorized work/resume request."
+      ].join("\n");
+      return textResult(text, status as unknown as Record<string, unknown>);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "work_window_status",
+    {
+      title: "Work Window Status",
+      description: "Read one durable Work Window state. This is read-only and never creates or renews a Work Window.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id bound to the Work Window."),
+        work_window_id: z.string().uuid().describe("Explicit Work Window UUID.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const status = await workWindowGuard.status(workspace, args.work_window_id);
+      return textResult(
+        `# Work Window Status\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nDrain at: ${status.drain_at_kst}\nDeadline: ${status.deadline_kst}\nRemaining to drain: ${status.remaining_to_drain_ms} ms\nRemaining to deadline: ${status.remaining_to_deadline_ms} ms`,
+        status as unknown as Record<string, unknown>
+      );
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "list_active_work_windows",
+    {
+      title: "List Active Work Windows",
+      description: "Read durable Work Windows for the selected workspace. Returns ACTIVE and DRAINING windows only; stopped and expired windows are excluded.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id. Omit to use the selected workspace.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const windows = await workWindowGuard.listActive(workspace);
+      const text = windows.length
+        ? ["# Active Work Windows", "", ...windows.map((item) => `- ${item.work_window_id}  ${item.state}  deadline=${item.deadline_kst}`)].join("\n")
+        : "# Active Work Windows\n\n- none";
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        windows,
+        count: windows.length
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "checkpoint_work_window",
+    {
+      title: "Checkpoint Work Window",
+      description: "Persist one bounded latest checkpoint for an existing Work Window. Allowed while ACTIVE, DRAINING, or EXPIRED; it does not extend deadlines and cannot mutate source.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id bound to the Work Window."),
+        work_window_id: z.string().uuid().describe("Explicit Work Window UUID."),
+        completed: z.array(z.string().max(1000)).max(50).optional(),
+        pending: z.array(z.string().max(1000)).max(50).optional(),
+        resume_from: z.string().max(2000).optional(),
+        finding: z.array(z.string().max(1000)).max(50).optional(),
+        test_completed: z.array(z.string().max(1000)).max(50).optional(),
+        test_not_run: z.array(z.string().max(1000)).max(50).optional()
+      },
+      annotations: HANDOFF_WRITE_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const status = await workWindowGuard.checkpoint(workspace, args.work_window_id, {
+        completed: args.completed,
+        pending: args.pending,
+        resumeFrom: args.resume_from,
+        finding: args.finding,
+        testCompleted: args.test_completed,
+        testNotRun: args.test_not_run
+      });
+      return textResult(
+        `# Checkpoint Work Window\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nDeadline unchanged: ${status.deadline_kst}`,
+        status as unknown as Record<string, unknown>
+      );
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "stop_work_window",
+    {
+      title: "Stop Work Window",
+      description: "Stop an existing Work Window without changing its original start, drain, or deadline timestamps. This never rolls back, resets, cleans, checks out, or stashes repository state.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id bound to the Work Window."),
+        work_window_id: z.string().uuid().describe("Explicit Work Window UUID.")
+      },
+      annotations: HANDOFF_WRITE_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const status = await workWindowGuard.stop(workspace, args.work_window_id);
+      return textResult(
+        `# Stop Work Window\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nOriginal deadline: ${status.deadline_kst}`,
+        status as unknown as Record<string, unknown>
+      );
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
     "write",
     {
       title: "Write File",
-      description: "Create or overwrite a meaningful text file inside the workspace. New files use an atomic rename; existing files retain their inode and metadata. Returns a unified diff; pass the SHA from read when overwriting shared files.",
+      description: "Create or overwrite a meaningful text file inside the workspace. Requires an explicit ACTIVE work_window_id for the same workspace. Existing path/write/secret/SHA safety gates remain in force.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        work_window_id: z.string().uuid().describe("Explicit ACTIVE Work Window UUID for this workspace."),
         path: z.string().describe("File path relative to workspace root."),
         content: z.string().describe("Complete file contents to write."),
         create_dirs: z.boolean().optional().describe("Create parent directories if missing. Default: true."),
@@ -2173,6 +2338,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const resolved = guard.resolve(workspace, args.path, { forWrite: true });
       assertWriteToolAllowed(config, resolved.relPath);
+      await workWindowGuard.assertMutationAllowed(workspace, args.work_window_id);
       const result = await writeTextFile(config, guard, workspace, args.path, String(args.content ?? ""), {
         createDirs: args.create_dirs !== false,
         overwrite: args.overwrite !== false,
@@ -2200,9 +2366,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "edit",
     {
       title: "Edit File",
-      description: "Apply a targeted exact text replacement while retaining the existing file inode and metadata. Returns a unified diff; pass the SHA from read to reject stale multi-session edits.",
+      description: "Apply a targeted exact text replacement while retaining the existing file inode and metadata. Requires an explicit ACTIVE work_window_id for the same workspace; existing write/path/SHA safety gates remain in force.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        work_window_id: z.string().uuid().describe("Explicit ACTIVE Work Window UUID for this workspace."),
         path: z.string().describe("File path relative to workspace root."),
         old_text: z.string().describe("Exact text to replace. Must match once unless replace_all=true."),
         new_text: z.string().describe("Replacement text."),
@@ -2221,6 +2388,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const resolved = guard.resolve(workspace, args.path, { forWrite: true });
       assertWriteToolAllowed(config, resolved.relPath);
+      await workWindowGuard.assertMutationAllowed(workspace, args.work_window_id);
       const result = await editTextFile(config, guard, workspace, args.path, String(args.old_text ?? ""), String(args.new_text ?? ""), {
         replaceAll: parseBool(args.replace_all, false),
         expectedReplacements: args.expected_replacements,
@@ -2249,9 +2417,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Apply Patch",
       description:
-        "Apply one unified diff patch inside the workspace. Paths are validated before applying. Prefer edit for tiny replacements and apply_patch for multi-file diffs.",
+        "Apply one unified diff patch inside the workspace. Requires an explicit ACTIVE work_window_id for the same workspace. Paths and existing patch safety rules are still validated before mutation.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        work_window_id: z.string().uuid().describe("Explicit ACTIVE Work Window UUID for this workspace."),
         patch: z.string().describe("Unified diff patch to apply. File paths must stay inside the workspace and avoid blocked paths.")
       },
       annotations: LOCAL_WRITE_ANNOTATIONS,
@@ -2263,6 +2432,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      await workWindowGuard.assertMutationAllowed(workspace, args.work_window_id);
       const result = await applyWorkspacePatch(config, guard, workspace, String(args.patch ?? ""));
       if (result.changed) invalidateWorkspaceAnalysis(workspace.id);
       const text = [
@@ -2294,9 +2464,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Import Attachment File",
       description:
-        "Import a ChatGPT Apps SDK attachment into the workspace. Accepts only a platform file object with download_url and file_id. Not a general URL downloader. Overwrite is off by default.",
+        "Import a ChatGPT Apps SDK attachment into the workspace. Requires an explicit ACTIVE work_window_id for the same workspace. Existing file-origin/path/hash safety gates remain in force.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        work_window_id: z.string().uuid().describe("Explicit ACTIVE Work Window UUID for this workspace."),
         file: z
           .object({
             download_url: z.string().describe("Temporary HTTPS download URL provided by ChatGPT."),
@@ -2321,6 +2492,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const resolved = guard.resolve(workspace, args.destination, { forWrite: true });
       assertWriteToolAllowed(config, resolved.relPath);
+      await workWindowGuard.assertMutationAllowed(workspace, args.work_window_id);
       const result = await importAttachmentFile(config, guard, workspace, {
         file: args.file,
         destination: String(args.destination ?? ""),
@@ -2364,9 +2536,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Bash",
       description:
-        "Run one allowlisted verification command in the workspace, such as tests, build, lint, typecheck, or a project script. Do not use for git status/diff or file inspection; use show_changes, tree, search, and read instead. Do not chain commands with &&, pipes, redirects, or shell file readers.",
+        "Run one allowlisted verification command in the workspace. Requires an explicit ACTIVE work_window_id; timeout is clamped so the process cannot run beyond the 27-minute ACTIVE/drain boundary. Existing bash/session/command safety rules remain in force.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        work_window_id: z.string().uuid().describe("Explicit ACTIVE Work Window UUID for this workspace."),
         command: z.string().describe("Command to run."),
         session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id. If configured on the server, a provided value must match it."),
         cwd: z.string().optional().describe("Working directory relative to workspace root. Default: ."),
@@ -2387,13 +2560,27 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      const windowBudget = await workWindowGuard.effectiveBashTimeout(
+        workspace,
+        args.work_window_id,
+        args.timeout_ms,
+        config.maxBashTimeoutMs
+      );
       const result = await runBash(config, guard, workspace, String(args.command ?? ""), {
         cwd: args.cwd,
-        timeoutMs: args.timeout_ms,
+        timeoutMs: windowBudget.timeoutMs,
         sessionId: args.session_id
       });
       const text = bashTextResult(config, result);
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        work_window_id: windowBudget.status.work_window_id,
+        work_window_state: windowBudget.status.state,
+        work_window_remaining_to_drain_ms: windowBudget.status.remaining_to_drain_ms,
+        ...result,
+        bash_session_id: result.bashSessionId ?? null
+      });
     }
   );
 

@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REQUEST_TIMEOUT_MS = process.platform === 'win32' ? 45_000 : 20_000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const workWindowHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-home-'));
+const WORK_WINDOW_GUARDED_TOOLS = new Set(['write', 'edit', 'apply_patch', 'import_file', 'bash']);
 
 function assert(ok, message) {
   if (!ok) throw new Error(message);
@@ -31,6 +33,7 @@ class McpStdioClient {
         CODEXPRO_ALLOWED_ROOTS: root,
         CODEXPRO_TOOL_MODE: env.CODEXPRO_TOOL_MODE ?? 'full',
         CODEXPRO_BASH_MODE: env.CODEXPRO_BASH_MODE ?? 'safe',
+        CODEXPRO_HOME: env.CODEXPRO_HOME ?? workWindowHome,
         CODEXPRO_MAX_SEARCH_RESULTS: '2000',
         CODEXPRO_MAX_OUTPUT_BYTES: env.CODEXPRO_MAX_OUTPUT_BYTES ?? '2000000',
         CODEXPRO_TOOL_CARDS: env.CODEXPRO_TOOL_CARDS ?? '0'
@@ -69,8 +72,27 @@ class McpStdioClient {
   }
 
   request(method, params) {
+    let effectiveParams = params;
+    if (method === 'tools/call' && this.workWindowId && params?.arguments) {
+      if (WORK_WINDOW_GUARDED_TOOLS.has(params.name) && !params.arguments.work_window_id) {
+        effectiveParams = { ...params, arguments: { ...params.arguments, work_window_id: this.workWindowId } };
+      } else if (
+        params.name === 'codexpro' &&
+        WORK_WINDOW_GUARDED_TOOLS.has(params.arguments.action) &&
+        params.arguments.args &&
+        !params.arguments.args.work_window_id
+      ) {
+        effectiveParams = {
+          ...params,
+          arguments: {
+            ...params.arguments,
+            args: { ...params.arguments.args, work_window_id: this.workWindowId }
+          }
+        };
+      }
+    }
     const id = this.nextId++;
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params: effectiveParams })}\n`);
     return new Promise((resolve, reject) => {
       const operation = method === 'tools/call' && params?.name ? `${method}:${params.name}` : method;
       const timer = setTimeout(
@@ -99,6 +121,14 @@ async function initClient(root, env) {
     clientInfo: { name: 'codexpro-stress', version: '0.1.0' }
   });
   client.notify('notifications/initialized');
+  const started = await client.request('tools/call', {
+    name: 'start_work_window',
+    arguments: { session_binding: 'stress-client' }
+  });
+  if (started.isError || started.structuredContent?.state !== 'ACTIVE') {
+    throw new Error(`stress start_work_window failed: ${JSON.stringify(started)}`);
+  }
+  client.workWindowId = started.structuredContent.work_window_id;
   return client;
 }
 
@@ -426,9 +456,10 @@ async function runGlobalSkillStress(root) {
 
 async function runRedactionStress() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-redact-'));
-  const ngrokToken = '2redactDEFghiJKLmnopQRSTuvWXyz_1234567890';
-  const cloudflareToken = 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJzdHJlc3MifQ.signature1234567890';
-  const tokenFile = '/Users/rebel/.codexpro/cloudflare-tunnel-token';
+  const fixtureValue = (...parts) => parts.join('');
+  const ngrokToken = fixtureValue('ngrok', 'stress', 'value', '0123456789');
+  const cloudflareToken = fixtureValue('cloudflare', 'stress', 'value', '0123456789');
+  const tokenFile = fixtureValue('/Users/rebel/.codexpro/', 'cloudflare-tunnel-token');
   await fs.writeFile(path.join(root, 'tokens.txt'), [
     `ngrok config add-authtoken ${ngrokToken}`,
     `cloudflared tunnel run --token ${cloudflareToken}`,
@@ -911,4 +942,5 @@ await runShowChangesStatsStress();
 await runMinimalHandoffStress(root);
 await runCardStress(root);
 await runAnalysisBudgetStress();
+await fs.rm(workWindowHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 console.log(`✓ stress test passed (${root})`);

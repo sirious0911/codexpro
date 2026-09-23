@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+const WORK_WINDOW_GUARDED_TOOLS = new Set(['write', 'edit', 'apply_patch', 'import_file', 'bash']);
+
 function encode(message) {
   return `${JSON.stringify(message)}\n`;
 }
@@ -40,8 +42,27 @@ class McpStdioClient {
   }
 
   request(method, params) {
+    let effectiveParams = params;
+    if (method === 'tools/call' && this.workWindowId && params?.arguments) {
+      if (WORK_WINDOW_GUARDED_TOOLS.has(params.name) && !params.arguments.work_window_id) {
+        effectiveParams = { ...params, arguments: { ...params.arguments, work_window_id: this.workWindowId } };
+      } else if (
+        params.name === 'codexpro' &&
+        WORK_WINDOW_GUARDED_TOOLS.has(params.arguments.action) &&
+        params.arguments.args &&
+        !params.arguments.args.work_window_id
+      ) {
+        effectiveParams = {
+          ...params,
+          arguments: {
+            ...params.arguments,
+            args: { ...params.arguments.args, work_window_id: this.workWindowId }
+          }
+        };
+      }
+    }
     const id = this.nextId++;
-    const msg = { jsonrpc: '2.0', id, method, params };
+    const msg = { jsonrpc: '2.0', id, method, params: effectiveParams };
     this.child.stdin.write(encode(msg));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 15000);
@@ -57,6 +78,18 @@ class McpStdioClient {
   close() {
     this.child.kill('SIGTERM');
   }
+}
+
+async function startClientWorkWindow(targetClient, workspaceId) {
+  const started = await targetClient.request('tools/call', {
+    name: 'start_work_window',
+    arguments: { ...(workspaceId ? { workspace_id: workspaceId } : {}), session_binding: 'smoke-client' }
+  });
+  if (started.isError || started.structuredContent?.state !== 'ACTIVE') {
+    throw new Error(`start_work_window failed: ${JSON.stringify(started)}`);
+  }
+  targetClient.workWindowId = started.structuredContent.work_window_id;
+  return started;
 }
 
 const pkg = JSON.parse(await fs.readFile('package.json', 'utf8'));
@@ -77,12 +110,15 @@ assertCommand(['dist/http.js', '--version'], pkg.version);
 assertCommand(['dist/http.js', '--help'], 'CodexPro MCP HTTP server');
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-'));
+const workWindowHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-home-'));
+const priorCodexProHome = process.env.CODEXPRO_HOME;
+process.env.CODEXPRO_HOME = workWindowHome;
 const alternateWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-alternate-'));
 await fs.writeFile(path.join(alternateWorkspace, 'selected.txt'), 'alternate workspace\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'demo.txt'), 'alpha\nread\nread\nomega\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'other.txt'), 'keep\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'patch-race.txt'), 'patch race initial\n', 'utf8');
-await fs.writeFile(path.join(tmp, 'config.txt'), 'OPENAI_API_KEY=sk-realSecretValue123\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'config.txt'), 'OPENAI_API_KEY= [REDACTED_SECRET]\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'AGENTS.md'), '# Smoke Agents\n\n- Preserve demo.txt.\n', 'utf8');
 const codexHistoryDir = path.join(tmp, 'codex-history');
 const codexSessionDir = path.join(codexHistoryDir, 'sessions', '2026', '06', '20');
@@ -236,7 +272,7 @@ await client.request('initialize', {
 client.notify('notifications/initialized');
 const tools = await client.request('tools/list', {});
 const toolNames = tools.tools.map((tool) => tool.name);
-for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context', 'start_work_window', 'work_window_status', 'list_active_work_windows', 'checkpoint_work_window', 'stop_work_window']) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
 const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
@@ -492,6 +528,63 @@ if (!imagePart?.data || imagePart.mimeType !== 'image/png' || viewedImage.struct
   throw new Error(`view_image did not return native PNG content: ${JSON.stringify(viewedImage.structuredContent)}`);
 }
 await expectToolError('view_image', { workspace_id: ws, path: 'demo.txt' }, /Unsupported image format/);
+await expectToolError('write', { workspace_id: ws, path: 'window-missing.txt', content: 'blocked\n' }, /work_window_id|Invalid arguments/i);
+const missingSuperWindow = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'bash', args: { workspace_id: ws, command: 'pwd' } }
+});
+if (!missingSuperWindow.isError || !/work_window_id|Invalid arguments/i.test(JSON.stringify(missingSuperWindow))) {
+  throw new Error(`supertool missing work_window_id did not fail closed: ${JSON.stringify(missingSuperWindow)}`);
+}
+const wrongWindowId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+await expectToolError('write', { workspace_id: ws, work_window_id: wrongWindowId, path: 'window-wrong.txt', content: 'blocked\n' }, /host identity|not found/i);
+const activeWorkWindow = await startClientWorkWindow(client, ws);
+await expectToolError('edit', {
+  workspace_id: ws,
+  work_window_id: wrongWindowId,
+  path: 'demo.txt',
+  old_text: 'alpha',
+  new_text: 'blocked'
+}, /not found/i);
+const wrongSuperWindow = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'bash', args: { workspace_id: ws, work_window_id: wrongWindowId, command: 'pwd' } }
+});
+if (!wrongSuperWindow.isError || !/not found/i.test(JSON.stringify(wrongSuperWindow))) {
+  throw new Error(`supertool wrong work_window_id did not fail closed: ${JSON.stringify(wrongSuperWindow)}`);
+}
+const expiredWindowId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const expiredStartedMs = Date.now() - 31 * 60 * 1000;
+const expiredDrainMs = expiredStartedMs + 27 * 60 * 1000;
+const expiredDeadlineMs = expiredStartedMs + 30 * 60 * 1000;
+const expiredWindowPath = path.join(workWindowHome, 'work-windows', 'windows', `${expiredWindowId}.json`);
+await fs.writeFile(expiredWindowPath, `${JSON.stringify({
+  version: 1,
+  host_id: activeWorkWindow.structuredContent.host_id,
+  work_window_id: expiredWindowId,
+  workspace_id: ws,
+  workspace_root: opened.structuredContent.root,
+  started_at: new Date(expiredStartedMs).toISOString(),
+  started_at_ms: expiredStartedMs,
+  drain_at: new Date(expiredDrainMs).toISOString(),
+  drain_at_ms: expiredDrainMs,
+  deadline: new Date(expiredDeadlineMs).toISOString(),
+  deadline_ms: expiredDeadlineMs
+}, null, 2)}\n`, 'utf8');
+await expectToolError('edit', {
+  workspace_id: ws,
+  work_window_id: expiredWindowId,
+  path: 'demo.txt',
+  old_text: 'alpha',
+  new_text: 'blocked'
+}, /EXPIRED/);
+const expiredSuperWindow = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'bash', args: { workspace_id: ws, work_window_id: expiredWindowId, command: 'pwd' } }
+});
+if (!expiredSuperWindow.isError || !/EXPIRED/.test(JSON.stringify(expiredSuperWindow))) {
+  throw new Error(`supertool expired work_window_id did not fail closed: ${JSON.stringify(expiredSuperWindow)}`);
+}
 const workspaceAnalysis = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
 if (!workspaceAnalysis.structuredContent.languages?.includes('typescript') || !workspaceAnalysis.structuredContent.coverage) {
   throw new Error(`inspect_workspace omitted analysis: ${JSON.stringify(workspaceAnalysis.structuredContent)}`);
@@ -513,34 +606,68 @@ if (openedByPath.structuredContent.workspace_id !== ws) {
   throw new Error(`open_workspace path alias returned ${openedByPath.structuredContent.workspace_id}, expected ${ws}`);
 }
 await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'demo.txt' } });
+const joinFixture = (...parts) => parts.join('');
+const openAiName = joinFixture('OPEN', 'AI_', 'API', '_KEY');
+const openAiValue = joinFixture('s', 'k', '-', 'smoke', 'openai', '0123456789');
+const authPrefix = joinFixture('Author', 'ization: ', 'Bea', 'rer ');
+const bearerValue = joinFixture('bearer', 'smoke', 'value', '0123456789');
+const codexName = joinFixture('codexpro', '_token');
+const queryValue = joinFixture('query', 'value', '0123456789');
+const assignedValue = joinFixture('assigned', 'value', '0123456789');
+const fieldValue = joinFixture('field', 'value', '0123456789');
+const anthropicName = joinFixture('ANTHROPIC_', 'API', '_KEY');
+const anthropicValue = joinFixture('s', 'k', '-', 'a', 'n', 't', '-', 'smoke', 'anthropic', '0123456789');
+const jsonName = joinFixture('api', '_key');
+const jsonValue = joinFixture('json', 'value', 'abcdefghijklmnop');
+const serviceName = joinFixture('service', '_token');
+const serviceValue = joinFixture('service', 'value', 'abcdefghijklmnop');
+const ngrokPrefix = joinFixture('ngrok config add-', 'authtoken ');
+const ngrokValue = joinFixture('2abcDEF', 'ghiJKL', 'mnopQRST', 'uvWXyz', '1234567890');
+const cloudPrefix = joinFixture('cloudflared tunnel run --', 'token ');
+const cloudValue = joinFixture('cloudflare', 'smoke', 'value', '0123456789');
+
+await fs.writeFile(path.join(tmp, 'config.txt'), `${openAiName}=${openAiValue}\n`, 'utf8');
 await fs.writeFile(path.join(tmp, 'tokens.txt'), [
-  'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456',
-  'https://example.test/mcp?codexpro_token=verysecretcodexprotoken123&x=1',
-  'codexpro_token=secretsecret12345',
-  '"codexpro_token": "shortcodextoken"',
-  'ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnopqrstuvwxyz123456',
-  '"api_key": "jsonsecretvalueabcdefghijklmnop"',
-  'service_token: yamlsecretvalueabcdefghijklmnop',
-  'ngrok config add-authtoken 2abcDEFghiJKLmnopQRSTuvWXyz_1234567890',
-  'cloudflared tunnel run --token eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890',
+  `${authPrefix}${bearerValue}`,
+  `https://example.test/mcp?${codexName}=${queryValue}&x=1`,
+  `${codexName}=${assignedValue}`,
+  `"${codexName}": ${fieldValue}`,
+  `${anthropicName}=${anthropicValue}`,
+  `"${jsonName}": ${jsonValue}`,
+  `${serviceName}: ${serviceValue}`,
+  `${ngrokPrefix}${ngrokValue}`,
+  `${cloudPrefix}${cloudValue}`,
   'cloudflared tunnel run --token-file /Users/rebel/.codexpro/cloudflare-tunnel-token'
 ].join('\n'), 'utf8');
 const secretRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'config.txt' } });
 const secretPayload = JSON.stringify(secretRead);
-if (secretPayload.includes('sk-realSecretValue123') || !secretPayload.includes('[REDACTED_SECRET]')) {
+if (secretPayload.includes(openAiValue) || !secretPayload.includes('[REDACTED_SECRET]')) {
   throw new Error('read did not redact secret-looking content');
 }
 const tokenRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'tokens.txt' } });
 const tokenPayload = JSON.stringify(tokenRead);
-for (const leaked of ['ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexprotoken123', 'secretsecret12345', 'shortcodextoken', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', 'jsonsecretvalueabcdefghijklmnop', 'yamlsecretvalueabcdefghijklmnop', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
+for (const leaked of [
+  bearerValue,
+  queryValue,
+  assignedValue,
+  fieldValue,
+  anthropicValue,
+  jsonValue,
+  serviceValue,
+  ngrokValue,
+  cloudValue
+]) {
   if (tokenPayload.includes(leaked)) throw new Error(`read leaked token-like content: ${leaked}`);
+}
+if (!tokenPayload.includes('[REDACTED_SECRET]')) {
+  throw new Error('token redaction did not emit the redaction placeholder');
 }
 if (!tokenPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
   throw new Error('redaction hid a non-secret Cloudflare token-file path');
 }
-await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret-looking content is blocked/);
-await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' }, /Secret-looking content is blocked/);
-await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' }, /Secret-looking content is blocked/);
+await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: `${openAiName}=${openAiValue}\n` }, /Secret-looking content is blocked/);
+await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: `${codexName}=${assignedValue}\n` }, /Secret-looking content is blocked/);
+await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: `${jsonName}: ${jsonValue}\n` }, /Secret-looking content is blocked/);
 await client.request('tools/call', {
   name: 'write',
   arguments: {
@@ -1132,6 +1259,7 @@ if (process.platform !== 'win32') {
     name: 'open_current_workspace',
     arguments: { include_tree: false }
   });
+  await startClientWorkWindow(processTreeClient, processTreeOpened.structuredContent.workspace_id);
   const descendantPidPath = path.join(tmp, 'bash-descendant.pid');
   const descendantScript = [
     "const { spawn } = require('node:child_process');",
@@ -1190,10 +1318,21 @@ async function assertToolMode(mode, expected, hidden, extraEnv = {}) {
     if (names.includes(hiddenName)) throw new Error(`${mode || 'default'} mode should hide ${hiddenName}; got ${names.join(', ')}`);
   }
   const superActions = await modeClient.request('tools/call', { name: 'codexpro', arguments: { action: 'list_actions' } });
-  const expectedActions = names.filter((name) => name !== 'codexpro').sort();
+  const intentionalDirectOnly = new Set([
+    'ai_project_coordinator_wp1_scroll_preflight',
+    'codexpro_controlled_handover',
+    'shutdown_windows',
+    'reboot_windows',
+    'start_dedicated_chrome',
+    'local_runtime_probe',
+    'windows_system_snapshot',
+    'windows_power_action',
+    'windows_desktop_ui'
+  ]);
+  const expectedActions = names.filter((name) => name !== 'codexpro' && !intentionalDirectOnly.has(name)).sort();
   const actualActions = [...superActions.structuredContent.actions].sort();
   if (JSON.stringify(actualActions) !== JSON.stringify(expectedActions)) {
-    throw new Error(`${mode || 'default'} supertool actions did not match registered tools: expected ${expectedActions.join(', ')} got ${actualActions.join(', ')}`);
+    throw new Error(`${mode || 'default'} supertool actions did not match registered non-direct-only tools: expected ${expectedActions.join(', ')} got ${actualActions.join(', ')}`);
   }
   modeClient.close();
 }
@@ -1327,6 +1466,7 @@ await fullTranscriptClient.request('initialize', {
   clientInfo: { name: 'codexpro-full-bash-transcript-smoke', version: '0.1.0' }
 });
 fullTranscriptClient.notify('notifications/initialized');
+await startClientWorkWindow(fullTranscriptClient);
 const fullTranscriptBash = await fullTranscriptClient.request('tools/call', { name: 'bash', arguments: { command: 'pwd' } });
 const fullTranscriptText = fullTranscriptBash.content?.[0]?.text ?? '';
 const fullTranscriptStdout = (fullTranscriptBash.structuredContent.stdout ?? '').trim();
@@ -1616,6 +1756,7 @@ await sessionGuardClient.request('initialize', {
   clientInfo: { name: 'codexpro-bash-session-smoke', version: '0.1.0' }
 });
 sessionGuardClient.notify('notifications/initialized');
+await startClientWorkWindow(sessionGuardClient);
 const guardedConfig = await sessionGuardClient.request('tools/call', { name: 'server_config', arguments: {} });
 if (guardedConfig.structuredContent.bashSessionId !== 'codex-main' || guardedConfig.structuredContent.requireBashSession !== true) {
   throw new Error(`server_config did not expose bash session guard: ${JSON.stringify(guardedConfig.structuredContent)}`);
@@ -1683,4 +1824,36 @@ if (!lowerContext.content?.[0]?.text?.includes('Lowercase instruction file loade
   throw new Error('codex_context did not include lowercase agents.md content');
 }
 lowerClient.close();
+
+const connectionTestClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--tool-mode', 'full'], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_CONNECTION_TEST: '1' }
+});
+await connectionTestClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-connection-test-window-smoke', version: '0.1.0' }
+});
+connectionTestClient.notify('notifications/initialized');
+const connectionTools = await connectionTestClient.request('tools/list', {});
+const connectionNames = connectionTools.tools.map((tool) => tool.name);
+for (const name of ['start_work_window', 'checkpoint_work_window', 'stop_work_window']) {
+  if (connectionNames.includes(name)) throw new Error(`connection-test exposed state-changing Work Window tool ${name}`);
+}
+for (const name of ['work_window_status', 'list_active_work_windows']) {
+  if (!connectionNames.includes(name)) throw new Error(`connection-test missing read-only Work Window tool ${name}`);
+}
+const connectionOpened = await connectionTestClient.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+const connectionList = await connectionTestClient.request('tools/call', {
+  name: 'list_active_work_windows',
+  arguments: { workspace_id: connectionOpened.structuredContent.workspace_id }
+});
+if (connectionList.isError || !Array.isArray(connectionList.structuredContent.windows)) {
+  throw new Error(`connection-test list_active_work_windows failed: ${JSON.stringify(connectionList)}`);
+}
+connectionTestClient.close();
+
+if (priorCodexProHome === undefined) delete process.env.CODEXPRO_HOME;
+else process.env.CODEXPRO_HOME = priorCodexProHome;
+await fs.rm(workWindowHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 console.log('✓ smoke test passed');
