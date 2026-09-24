@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 export const CODEXPRO_CONTROLLED_HANDOVER_TOOL_NAME = "codexpro_controlled_handover";
@@ -41,6 +41,7 @@ export interface ControlledHandoverPlan {
   controlFile: string;
   lockFile: string;
   launcherFile: string;
+  expectedLauncherSha256: string;
 }
 
 function assertRegularFile(file: string, label: string): void {
@@ -51,6 +52,11 @@ function assertRegularFile(file: string, label: string): void {
     throw new Error(`${label} is unavailable: ${file}`);
   }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must be a regular file: ${file}`);
+}
+
+export function launcherSha256(file: string): string {
+  assertRegularFile(file, "Canonical CodexPro launcher");
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
 function assertRegularDirectory(dir: string, label: string): void {
@@ -111,7 +117,8 @@ export function buildControlledHandoverPlan(
     expectedSupervisorPid,
     controlFile: paths.controlFile,
     lockFile: paths.lockFile,
-    launcherFile: paths.launcherFile
+    launcherFile: paths.launcherFile,
+    expectedLauncherSha256: launcherSha256(paths.launcherFile)
   };
 }
 
@@ -125,11 +132,12 @@ export function requestControlledHandover(
   const requestId = (context.requestId ?? randomUUID)();
   const requestedAt = (context.now ?? new Date()).toISOString();
   const payload = {
-    version: 1,
+    version: 2,
     action: CODEXPRO_CONTROLLED_HANDOVER_ACTION,
     requestId,
     requestedAt,
-    expectedSupervisorPid: plan.expectedSupervisorPid
+    expectedSupervisorPid: plan.expectedSupervisorPid,
+    expectedLauncherSha256: plan.expectedLauncherSha256
   };
 
   let fd: number | null = null;
