@@ -207,6 +207,9 @@ function postToolsListWithSession(baseUrl, token, sessionId) {
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-smoke-'));
 const alternateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-alternate-'));
 await fs.writeFile(path.join(alternateRoot, 'selected.txt'), 'http alternate workspace\n', 'utf8');
+const nestedRoot = path.join(root, 'nested-workspace');
+await fs.mkdir(nestedRoot, { recursive: true });
+await fs.writeFile(path.join(nestedRoot, 'nested.txt'), 'http nested workspace\n', 'utf8');
 const profileHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-profile-home-'));
 await fs.mkdir(path.join(root, '.codex', 'skills', 'http-smoke-skill'), { recursive: true });
 await fs.writeFile(path.join(root, '.codex', 'skills', 'http-smoke-skill', 'SKILL.md'), [
@@ -690,6 +693,61 @@ try {
     const firstList = await callTool(firstClient, 'list_workspaces');
     if (firstList.structuredContent.selected_workspace_id !== alternate.structuredContent.workspace_id) {
       throw new Error(`first HTTP session lost its workspace selection: ${JSON.stringify(firstList.structuredContent)}`);
+    }
+  });
+
+  let nestedWorkspaceId;
+  await withClient(mcpUrl, async (client) => {
+    const nested = await callTool(client, 'open_workspace', {
+      root: nestedRoot,
+      include_tree: false
+    });
+    nestedWorkspaceId = nested.structuredContent.workspace_id;
+  });
+
+  await withClient(mcpUrl, async (client) => {
+    const nestedRead = await callTool(client, 'read', {
+      workspace_id: nestedWorkspaceId,
+      path: 'nested.txt'
+    });
+    const nestedText = nestedRead.content?.find?.((part) => part.type === 'text')?.text ?? '';
+    if (!nestedText.includes('http nested workspace')) {
+      throw new Error('explicit nested workspace_id did not survive a new HTTP MCP session: ' + nestedText);
+    }
+
+    const restoredList = await callTool(client, 'list_workspaces');
+    const restoredIds = restoredList.structuredContent.workspaces.map((workspace) => workspace.id);
+    if (restoredList.structuredContent.selected_workspace_id !== opened) {
+      throw new Error('explicit shared workspace_id changed session selection away from default workspace');
+    }
+    if (restoredList.structuredContent.selected_workspace_id === nestedWorkspaceId) {
+      throw new Error('explicit shared workspace_id unexpectedly became selected workspace');
+    }
+    if (!restoredIds.includes(nestedWorkspaceId)) {
+      throw new Error('restored shared workspace_id missing from session workspace inventory');
+    }
+  });
+
+  await fs.rm(nestedRoot, { recursive: true, force: true });
+  await withClient(mcpUrl, async (client) => {
+    try {
+      await callTool(client, 'read', { workspace_id: nestedWorkspaceId, path: 'nested.txt' });
+      throw new Error('stale shared workspace_id unexpectedly restored after its real root was removed');
+    } catch (error) {
+      const message = String(error);
+      if (!message.includes('Unknown workspace_id:') || !message.includes(nestedWorkspaceId)) throw error;
+    }
+  });
+
+  await fs.mkdir(nestedRoot, { recursive: true });
+  await fs.writeFile(path.join(nestedRoot, 'nested.txt'), 'http nested workspace recreated\n', 'utf8');
+  await withClient(mcpUrl, async (client) => {
+    try {
+      await callTool(client, 'read', { workspace_id: nestedWorkspaceId, path: 'nested.txt' });
+      throw new Error('evicted shared workspace_id unexpectedly returned after recreating the same real root');
+    } catch (error) {
+      const message = String(error);
+      if (!message.includes('Unknown workspace_id:') || !message.includes(nestedWorkspaceId)) throw error;
     }
   });
 

@@ -1026,8 +1026,11 @@ const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, d
 const POWER_ACTION_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const LOCAL_PROCESS_START_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 
-export function createCodexProServer(config: CodexProConfig): McpServer {
-  const workspaces = new WorkspaceManager(config);
+export function createCodexProServer(
+  config: CodexProConfig,
+  options: { sharedWorkspaceRoots?: Map<string, string> } = {}
+): McpServer {
+  const workspaces = new WorkspaceManager(config, options.sharedWorkspaceRoots);
   const workWindowGuard = new WorkWindowGuard();
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);

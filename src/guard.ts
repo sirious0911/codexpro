@@ -62,7 +62,7 @@ export class WorkspaceManager {
   private readonly workspaces = new Map<string, Workspace>();
   private selectedWorkspaceId?: string;
 
-  constructor(private readonly config: CodexProConfig) {}
+  constructor(private readonly config: CodexProConfig, private readonly sharedWorkspaceRoots?: Map<string, string>) {}
 
   defaultWorkspace(): Workspace {
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot);
@@ -95,6 +95,7 @@ export class WorkspaceManager {
 
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === realRoot);
     if (existing) {
+      this.sharedWorkspaceRoots?.set(existing.id, existing.root);
       if (options.select !== false) this.selectedWorkspaceId = existing.id;
       return existing;
     }
@@ -102,6 +103,7 @@ export class WorkspaceManager {
     const id = workspaceIdForRoot(realRoot);
     const workspace = { id, root: realRoot, openedAt: new Date().toISOString() };
     this.workspaces.set(id, workspace);
+    this.sharedWorkspaceRoots?.set(id, realRoot);
     if (options.select !== false) this.selectedWorkspaceId = id;
     return workspace;
   }
@@ -118,6 +120,18 @@ export class WorkspaceManager {
     if (!workspace) {
       const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
       if (configuredRoot) return this.openWorkspace(configuredRoot, { select: false });
+    }
+    if (!workspace) {
+      const sharedRoot = this.sharedWorkspaceRoots?.get(id);
+      if (sharedRoot) {
+        try {
+          const restored = this.openWorkspace(sharedRoot, { select: false });
+          if (restored.id === id) return restored;
+        } catch {
+          // Treat stale or no-longer-allowed shared roots as unknown.
+        }
+        this.sharedWorkspaceRoots?.delete(id);
+      }
     }
     if (!workspace) {
       throw new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);
