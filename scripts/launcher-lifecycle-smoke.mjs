@@ -106,7 +106,19 @@ try {
   assert.match(launcherTemplate, /if \"%EXIT_CODE%\"==\"0\" goto stopped/);
   assert.match(launcherTemplate, /if \"%EXIT_CODE%\"==\"42\" goto fail_startup_identity/);
   assert.match(launcherTemplate, /DUAL_SUPERVISOR_STARTUP_IDENTITY_REJECT code=%EXIT_CODE% action=NO_FALLBACK/);
-  assert.match(launcherTemplate, /LAUNCHER_LIFECYCLE=.*launcher-lifecycle\.mjs/);
+  assert.match(
+    launcherTemplate,
+    /SUPERVISOR=%TOOLS_ROOT%\\codexpro-official-patch\\package\\scripts\\transport-supervisor\.mjs/,
+  );
+  assert.match(
+    launcherTemplate,
+    /DUAL_SUPERVISOR=%TOOLS_ROOT%\\codexpro-official-patch\\package\\scripts\\dual-transport-supervisor\.mjs/,
+  );
+  assert.match(
+    launcherTemplate,
+    /LAUNCHER_LIFECYCLE=%TOOLS_ROOT%\\codexpro-official-patch\\package\\scripts\\launcher-lifecycle\.mjs/,
+  );
+  assert.doesNotMatch(launcherTemplate, /codexpro-source\\scripts/i);
   assert.match(launcherTemplate, /node \"%LAUNCHER_LIFECYCLE%\" consume-promotion/);
   assert.doesNotMatch(launcherTemplate, /if exist .*promote-to-dual\.request/i);
   assert.doesNotMatch(launcherTemplate, /del \/q .*promote-to-dual\.request/i);
