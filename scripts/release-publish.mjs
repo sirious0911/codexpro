@@ -1,11 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { assertCodexProReleaseEnvironment } from "./release-guard.mjs";
+import { resolveNpmInvocation } from "./npm-cli.mjs";
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const npmCli = process.env.npm_execpath;
+// npm is invoked shell-free through node + npm-cli.js.
+
 
 function runNpm(args, root) {
-  const result = spawnSync(npmCli ? process.execPath : npm, npmCli ? [npmCli, ...args] : args, {
+  const npmInvocation = resolveNpmInvocation(args);
+  const result = spawnSync(npmInvocation.command, npmInvocation.args, {
     cwd: root,
     stdio: "inherit",
     env: { ...process.env, INIT_CWD: root }

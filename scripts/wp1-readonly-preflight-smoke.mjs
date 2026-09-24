@@ -193,9 +193,13 @@ for (const forbidden of [
 }
 
 const serverSource = await fs.readFile(new URL('../src/server.ts', import.meta.url), 'utf8');
-assert.match(serverSource, /const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>\(\[WP1_READONLY_PREFLIGHT_TOOL_NAME\]\)/);
-assert.match(serverSource, /name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_TOOL_NAMES\.has\(name\)/);
-assert.match(serverSource, /SUPERTOOL_EXCLUDED_TOOL_NAMES\.has\(action\)/);
+const supertoolExcludedStart = serverSource.indexOf('const SUPERTOOL_EXCLUDED_TOOL_NAMES = new Set<string>([');
+const supertoolExcludedEnd = serverSource.indexOf(']);', supertoolExcludedStart);
+assert.ok(supertoolExcludedStart >= 0 && supertoolExcludedEnd > supertoolExcludedStart);
+const supertoolExcludedBlock = serverSource.slice(supertoolExcludedStart, supertoolExcludedEnd);
+assert.ok(supertoolExcludedBlock.includes('WP1_READONLY_PREFLIGHT_TOOL_NAME'));
+assert.match(serverSource, /name !== SUPERTOOL_NAME && !COMBINED_DIRECT_ONLY_TOOL_NAMES\.has\(name\)/);
+assert.match(serverSource, /COMBINED_DIRECT_ONLY_TOOL_NAMES\.has\(action\)/);
 assert.match(serverSource, /annotations: WP1_READONLY_PREFLIGHT_ANNOTATIONS/);
 
 const standardStart = serverSource.indexOf('const STANDARD_TOOL_NAMES = [');

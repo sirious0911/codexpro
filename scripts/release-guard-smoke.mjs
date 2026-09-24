@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveNpmInvocation } from "./npm-cli.mjs";
 
 const root = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const npmCli = process.env.npm_execpath;
+
+
 const manifest = JSON.parse(await (await import("node:fs/promises")).readFile(join(root, "package.json"), "utf8"));
 
 assert.equal(manifest.scripts.prepublishOnly, "node scripts/release-guard.mjs");
@@ -39,11 +40,24 @@ try {
   assert.match(wrongDirectory.output, /Release commands must run from the CodexPro root/);
 
   const prefixArgs = ["--prefix", root, "run", "release:guard", "--silent"];
-  const prefixInvocation = npmCli
-    ? run(process.execPath, [npmCli, ...prefixArgs], { cwd: wrongCwd })
-    : run(npm, prefixArgs, { cwd: wrongCwd });
+  const npmEnvWithoutExecPath = { ...process.env, npm_execpath: "" };
+  const resolvedNpm = resolveNpmInvocation(prefixArgs, { env: npmEnvWithoutExecPath });
+  assert.equal(resolvedNpm.command, process.execPath);
+  assert.match(resolvedNpm.args[0], /npm-cli.js$/i);
+  const prefixInvocation = run(resolvedNpm.command, resolvedNpm.args, {
+    cwd: wrongCwd,
+    env: { npm_execpath: "" }
+  });
   assert.notEqual(prefixInvocation.status, 0, prefixInvocation.output);
   assert.match(prefixInvocation.output, /Release commands must run from the CodexPro root/);
+
+  const releasePackSource = readFileSync(join(root, "scripts/release-pack.mjs"), "utf8");
+  const releasePublishSource = readFileSync(join(root, "scripts/release-publish.mjs"), "utf8");
+  for (const [label, source] of [["release-pack", releasePackSource], ["release-publish", releasePublishSource]]) {
+    assert.match(source, /resolveNpmInvocation/);
+    assert.doesNotMatch(source, /npm.cmd/);
+    assert.doesNotMatch(source, /spawnSync\(\s*(?:["']npm(?:\.cmd)?["']|npm\s*,)/);
+  }
 
   const packed = run(process.execPath, ["scripts/release-pack.mjs"], { cwd: root });
   assert.equal(packed.status, 0, packed.output);

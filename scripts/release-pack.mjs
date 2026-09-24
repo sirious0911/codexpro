@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { CODEXPRO_PACKAGE, assertCodexProReleaseEnvironment } from "./release-guard.mjs";
+import { resolveNpmInvocation } from "./npm-cli.mjs";
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const npmCli = process.env.npm_execpath;
+// npm is invoked shell-free through node + npm-cli.js.
+
 
 function fail(message) {
   throw new Error(message);
@@ -11,7 +12,8 @@ function fail(message) {
 try {
   const release = assertCodexProReleaseEnvironment();
   const packArgs = ["pack", "--dry-run", "--ignore-scripts", "--json"];
-  const packed = spawnSync(npmCli ? process.execPath : npm, npmCli ? [npmCli, ...packArgs] : packArgs, {
+  const npmInvocation = resolveNpmInvocation(packArgs);
+  const packed = spawnSync(npmInvocation.command, npmInvocation.args, {
     cwd: release.root,
     encoding: "utf8",
     env: { ...process.env, INIT_CWD: release.root }
