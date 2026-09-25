@@ -92,6 +92,27 @@ async function startClientWorkWindow(targetClient, workspaceId) {
   return started;
 }
 
+function assertTerminalOrientation(result, expectedState, expectedWorkspaceId, expectedRoot) {
+  const structured = result?.structuredContent ?? {};
+  const forbidden = ['tree', 'git_status', 'agents_loaded', 'agents_path', 'skills', 'skill_inventory', 'skill_counts'];
+  if (
+    result?.isError ||
+    structured.workspace_id !== expectedWorkspaceId ||
+    structured.selected_workspace_id !== expectedWorkspaceId ||
+    structured.root !== expectedRoot ||
+    structured.orientation_only !== true ||
+    structured.substantive_data_withheld !== true ||
+    structured.work_window_state !== expectedState ||
+    structured.must_stop !== true ||
+    structured.auto_renew_allowed !== false ||
+    structured.checkpoint_required !== (expectedState === 'DRAINING' || expectedState === 'EXPIRED') ||
+    forbidden.some((key) => key in structured)
+  ) {
+    throw new Error(`terminal orientation contract mismatch: state=${expectedState} result=${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
 const pkg = JSON.parse(await fs.readFile('package.json', 'utf8'));
 
 function assertCommand(args, expected) {
@@ -524,6 +545,15 @@ const inventory = await client.request('tools/call', { name: 'codexpro_inventory
 if (inventory.structuredContent.codexpro_tool !== 'codexpro_inventory') throw new Error('inventory result was not tagged for widget rendering');
 const opened = await client.request('tools/call', { name: 'open_workspace', arguments: { root: tmp, include_tree: true } });
 const ws = opened.structuredContent.workspace_id;
+if (
+  opened.isError ||
+  opened.structuredContent?.orientation_only === true ||
+  opened.structuredContent?.substantive_data_withheld === true ||
+  !opened.structuredContent?.tree ||
+  !('git_status' in opened.structuredContent)
+) {
+  throw new Error(`no-window open_workspace summary regressed: ${JSON.stringify(opened)}`);
+}
 const viewedImage = await client.request('tools/call', { name: 'view_image', arguments: { workspace_id: ws, path: 'pixel.png' } });
 const imagePart = viewedImage.content?.find?.((part) => part.type === 'image');
 if (!imagePart?.data || imagePart.mimeType !== 'image/png' || viewedImage.structuredContent.width !== 1 || viewedImage.structuredContent.height !== 1) {
@@ -628,14 +658,22 @@ const expiredOpen = await client.request('tools/call', {
   name: 'open_workspace',
   arguments: { root: alternateWorkspace, include_tree: true }
 });
-if (
-  !expiredOpen.isError ||
-  expiredOpen.structuredContent?.must_stop !== true ||
-  expiredOpen.structuredContent?.work_window_state !== 'EXPIRED' ||
-  expiredOpen.structuredContent?.tree
-) {
-  throw new Error(`open_workspace exposed terminal workspace data: ${JSON.stringify(expiredOpen)}`);
-}
+assertTerminalOrientation(
+  expiredOpen,
+  'EXPIRED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
+const expiredSuperOpen = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'open_workspace', args: { root: alternateWorkspace, include_tree: true } }
+});
+assertTerminalOrientation(
+  expiredSuperOpen,
+  'EXPIRED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
 const orientationConfig = await client.request('tools/call', { name: 'server_config', arguments: {} });
 const orientationList = await client.request('tools/call', { name: 'list_workspaces', arguments: {} });
 if (orientationConfig.isError || orientationList.isError) {
@@ -672,6 +710,19 @@ if (
   expiredCheckpoint.structuredContent?.deadline !== new Date(expiredDeadlineMs).toISOString()
 ) {
   throw new Error(`EXPIRED checkpoint did not atomically STOP: ${JSON.stringify(expiredCheckpoint)}`);
+}
+const stoppedOpen = await client.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: alternateWorkspace, include_tree: true }
+});
+assertTerminalOrientation(
+  stoppedOpen,
+  'STOPPED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
+if (stoppedOpen.structuredContent?.stopped_at !== expiredCheckpoint.structuredContent?.stopped_at) {
+  throw new Error(`STOPPED orientation did not preserve stopped_at: ${JSON.stringify(stoppedOpen)}`);
 }
 await assertTerminalTool(
   'read',
@@ -716,6 +767,188 @@ await client.request('tools/call', {
     work_window_id: alternateActive.structuredContent.work_window_id
   }
 });
+
+const restartClient = new McpStdioClient(
+  'node',
+  ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full'],
+  {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CODEXPRO_HOME: workWindowHome,
+      CODEXPRO_ROOT: tmp,
+      CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
+      CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
+      CODEXPRO_TOOL_CARDS: '0'
+    }
+  }
+);
+await restartClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-restart-bootstrap-smoke', version: '0.1.0' }
+});
+restartClient.notify('notifications/initialized');
+
+const restartInitialList = await restartClient.request('tools/call', { name: 'list_workspaces', arguments: {} });
+if (
+  restartInitialList.isError ||
+  restartInitialList.structuredContent?.workspaces?.some(
+    (workspace) => workspace.id === alternate.structuredContent.workspace_id
+  )
+) {
+  throw new Error(`restart client unexpectedly retained terminal target workspace: ${JSON.stringify(restartInitialList)}`);
+}
+
+const restartOrientation = await restartClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: alternateWorkspace, include_tree: true, include_skills: true }
+});
+assertTerminalOrientation(
+  restartOrientation,
+  'STOPPED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
+
+const restartSuperOrientation = await restartClient.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'open_workspace', args: { root: alternateWorkspace, include_tree: true, include_skills: true } }
+});
+assertTerminalOrientation(
+  restartSuperOrientation,
+  'STOPPED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
+
+const restartBlockedRead = await restartClient.request('tools/call', {
+  name: 'read',
+  arguments: { workspace_id: restartOrientation.structuredContent.workspace_id, path: 'selected.txt' }
+});
+if (
+  !restartBlockedRead.isError ||
+  restartBlockedRead.structuredContent?.must_stop !== true ||
+  restartBlockedRead.structuredContent?.work_window_state !== 'STOPPED'
+) {
+  throw new Error(`restart orientation bypassed terminal read latch: ${JSON.stringify(restartBlockedRead)}`);
+}
+
+const restartedWindow = await startClientWorkWindow(
+  restartClient,
+  restartOrientation.structuredContent.workspace_id
+);
+if (restartedWindow.structuredContent.work_window_id === alternateActive.structuredContent.work_window_id) {
+  throw new Error('restart bootstrap reused the terminal Work Window id');
+}
+const oldWindowAfterRestart = await restartClient.request('tools/call', {
+  name: 'work_window_status',
+  arguments: {
+    workspace_id: restartOrientation.structuredContent.workspace_id,
+    work_window_id: alternateActive.structuredContent.work_window_id
+  }
+});
+if (
+  oldWindowAfterRestart.isError ||
+  oldWindowAfterRestart.structuredContent?.state !== 'STOPPED' ||
+  oldWindowAfterRestart.structuredContent?.deadline !== alternateActive.structuredContent.deadline
+) {
+  throw new Error(`restart bootstrap altered the old terminal window: ${JSON.stringify(oldWindowAfterRestart)}`);
+}
+const restartResumedRead = await restartClient.request('tools/call', {
+  name: 'read',
+  arguments: { workspace_id: restartOrientation.structuredContent.workspace_id, path: 'selected.txt' }
+});
+if (restartResumedRead.isError || !restartResumedRead.structuredContent?.text?.includes('alternate workspace')) {
+  throw new Error(`restart bootstrap did not restore substantive read: ${JSON.stringify(restartResumedRead)}`);
+}
+const restartActiveOpen = await restartClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: alternateWorkspace, include_tree: false }
+});
+if (
+  restartActiveOpen.isError ||
+  restartActiveOpen.structuredContent?.orientation_only === true ||
+  restartActiveOpen.structuredContent?.substantive_data_withheld === true ||
+  !('git_status' in restartActiveOpen.structuredContent)
+) {
+  throw new Error(`ACTIVE open_workspace summary regressed after restart resume: ${JSON.stringify(restartActiveOpen)}`);
+}
+await restartClient.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: restartOrientation.structuredContent.workspace_id,
+    work_window_id: restartedWindow.structuredContent.work_window_id
+  }
+});
+restartClient.close();
+
+const defaultRestartClient = new McpStdioClient(
+  'node',
+  ['dist/stdio.js', '--root', alternateWorkspace, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full'],
+  {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CODEXPRO_HOME: workWindowHome,
+      CODEXPRO_ROOT: alternateWorkspace,
+      CODEXPRO_ALLOWED_ROOTS: alternateWorkspace,
+      CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
+      CODEXPRO_TOOL_CARDS: '0'
+    }
+  }
+);
+await defaultRestartClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-default-restart-bootstrap-smoke', version: '0.1.0' }
+});
+defaultRestartClient.notify('notifications/initialized');
+const defaultTerminalOpen = await defaultRestartClient.request('tools/call', {
+  name: 'open_current_workspace',
+  arguments: { include_tree: true, include_skills: true }
+});
+assertTerminalOrientation(
+  defaultTerminalOpen,
+  'STOPPED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
+const defaultTerminalSuperOpen = await defaultRestartClient.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'open_current_workspace', args: { include_tree: true, include_skills: true } }
+});
+assertTerminalOrientation(
+  defaultTerminalSuperOpen,
+  'STOPPED',
+  alternate.structuredContent.workspace_id,
+  alternate.structuredContent.root
+);
+const defaultRestartWindow = await startClientWorkWindow(
+  defaultRestartClient,
+  defaultTerminalOpen.structuredContent.workspace_id
+);
+const defaultActiveOpen = await defaultRestartClient.request('tools/call', {
+  name: 'open_current_workspace',
+  arguments: { include_tree: false }
+});
+if (
+  defaultActiveOpen.isError ||
+  defaultActiveOpen.structuredContent?.orientation_only === true ||
+  defaultActiveOpen.structuredContent?.substantive_data_withheld === true ||
+  !('git_status' in defaultActiveOpen.structuredContent)
+) {
+  throw new Error(`ACTIVE open_current_workspace summary regressed after restart resume: ${JSON.stringify(defaultActiveOpen)}`);
+}
+await defaultRestartClient.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: defaultTerminalOpen.structuredContent.workspace_id,
+    work_window_id: defaultRestartWindow.structuredContent.work_window_id
+  }
+});
+defaultRestartClient.close();
+
 const crossWorkspaceMainRead = await client.request('tools/call', {
   name: 'read',
   arguments: { workspace_id: ws, path: 'demo.txt' }
@@ -760,6 +993,16 @@ if (
   throw new Error(`wait_for_handoff did not clamp/postflight at drain boundary: elapsed=${longPollElapsed} result=${JSON.stringify(nearDrainPoll)}`);
 }
 await assertTerminalTool('read', { workspace_id: longPollWs, path: 'selected.txt' }, 'DRAINING');
+const nearDrainOpen = await client.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: longPollWorkspace, include_tree: true }
+});
+assertTerminalOrientation(
+  nearDrainOpen,
+  'DRAINING',
+  longPollWs,
+  longPollOpened.structuredContent.root
+);
 const nearDrainSuperRead = await client.request('tools/call', {
   name: 'codexpro',
   arguments: { action: 'read', args: { workspace_id: longPollWs, path: 'selected.txt' } }

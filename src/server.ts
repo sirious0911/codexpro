@@ -157,6 +157,30 @@ function annotateWorkWindowBoundary(result: any, status: WorkWindowStatus): any 
   return result;
 }
 
+function terminalWorkspaceOrientationResult(workspace: Workspace, status: WorkWindowStatus): any {
+  const fields = {
+    workspace_id: workspace.id,
+    selected_workspace_id: workspace.id,
+    root: workspace.root,
+    orientation_only: true,
+    substantive_data_withheld: true,
+    ...workWindowBoundaryFields(status),
+    ...(status.stopped_at ? { stopped_at: status.stopped_at } : {})
+  };
+  const text = [
+    "# Workspace Orientation",
+    "",
+    `Workspace: ${workspace.id}`,
+    `Root: ${workspace.root}`,
+    `Work Window: ${status.work_window_id}`,
+    `State: ${status.state}`,
+    "",
+    "Substantive workspace data is withheld while the latest Work Window is terminal.",
+    "After a new user-authorized work/resume request, call start_work_window with this workspace_id."
+  ].join("\n");
+  return textResult(text, fields);
+}
+
 function tagToolResult(result: any, name: string, options: Record<string, unknown>): any {
   if (!result || typeof result !== "object") return result;
   const structured = result.structuredContent;
@@ -1878,7 +1902,10 @@ export function createCodexProServer(
     },
     async (args) => {
       const workspace = workspaces.selectDefaultWorkspace();
-      await workWindowGuard.assertContinuationAllowed(workspace);
+      const workWindowStatus = await workWindowGuard.latestStatus(workspace);
+      if (workWindowStatus && workWindowStatus.state !== "ACTIVE") {
+        return terminalWorkspaceOrientationResult(workspace, workWindowStatus);
+      }
       const summary = await workspaceSummary(config, guard, workspace, {
         includeTree: parseBool(args.include_tree, false),
         maxDepth: limitInt(args.max_depth, 2, 1, 8),
@@ -1935,7 +1962,10 @@ export function createCodexProServer(
         throw new CodexProError("open_workspace accepts either root or path. If both are provided, they must match.");
       }
       const workspace = workspaces.openWorkspace(args.root ?? args.path);
-      await workWindowGuard.assertContinuationAllowed(workspace);
+      const workWindowStatus = await workWindowGuard.latestStatus(workspace);
+      if (workWindowStatus && workWindowStatus.state !== "ACTIVE") {
+        return terminalWorkspaceOrientationResult(workspace, workWindowStatus);
+      }
       const summary = await workspaceSummary(config, guard, workspace, {
         includeTree: args.include_tree !== false,
         maxDepth: limitInt(args.max_depth, 3, 1, 8),
