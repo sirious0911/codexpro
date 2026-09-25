@@ -22,6 +22,32 @@ export interface AttachmentFileReference {
 
 export type MimeTypeStatus = "matched" | "mismatched" | "unknown";
 
+export async function hashImportFileSha256(absPath: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  const hasher = createHash("sha256");
+  const stream = fs.createReadStream(absPath, { signal });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      stream.on("data", (chunk) => {
+        signal?.throwIfAborted();
+        hasher.update(chunk);
+      });
+      stream.on("error", (error) => {
+        if (signal?.aborted) {
+          reject(signal.reason instanceof Error ? signal.reason : error);
+          return;
+        }
+        reject(error);
+      });
+      stream.on("end", () => resolve());
+    });
+    signal?.throwIfAborted();
+    return hasher.digest("hex");
+  } finally {
+    stream.destroy();
+  }
+}
+
 export interface ImportFileResult {
   path: string;
   bytes: number;
@@ -196,12 +222,14 @@ export function mimeTypeStatus(declared: string | null | undefined, detected: st
 async function downloadToTempFile(
   url: URL,
   maxBytes: number,
-  options: { allowLoopback: boolean; allowedHosts: string[]; env: NodeJS.ProcessEnv }
+  options: { allowLoopback: boolean; allowedHosts: string[]; env: NodeJS.ProcessEnv; signal?: AbortSignal }
 ): Promise<{ tempPath: string; bytes: number; contentType: string | null }> {
   const tempPath = path.join(os.tmpdir(), `codexpro-import-${process.pid}-${randomBytes(8).toString("hex")}.bin`);
   let current = url;
   for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
+    options.signal?.throwIfAborted();
     await assertSafeImportUrl(current.href, options);
+    options.signal?.throwIfAborted();
     const result = await new Promise<{
       statusCode: number;
       headers: http.IncomingHttpHeaders;
@@ -213,6 +241,7 @@ async function downloadToTempFile(
         current,
         {
           timeout: DOWNLOAD_TIMEOUT_MS,
+          signal: options.signal,
           headers: {
             Accept: "*/*",
             "User-Agent": "codexpro-import/0.30"
@@ -271,7 +300,13 @@ async function downloadToTempFile(
       request.on("timeout", () => {
         request.destroy(new CodexProError("Attachment download timed out."));
       });
-      request.on("error", (error) => reject(error instanceof Error ? error : new Error(String(error))));
+      request.on("error", (error) => {
+        if (options.signal?.aborted && options.signal.reason instanceof Error) {
+          reject(options.signal.reason);
+          return;
+        }
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
 
     if (result.redirectedTo) {
@@ -327,9 +362,11 @@ export async function importAttachmentFile(
     overwrite?: boolean;
     expectedSha256?: string;
     env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
   }
 ): Promise<ImportFileResult> {
   const env = options.env ?? process.env;
+  options.signal?.throwIfAborted();
   const reference = parseAttachmentFileReference(options.file);
   const destination = String(options.destination ?? "").trim();
   if (!destination) throw new CodexProError("destination is required.");
@@ -344,8 +381,10 @@ export async function importAttachmentFile(
     const downloaded = await downloadToTempFile(new URL(reference.download_url), maxBytes, {
       allowLoopback,
       allowedHosts,
-      env
+      env,
+      signal: options.signal
     });
+    options.signal?.throwIfAborted();
     tempPath = downloaded.tempPath;
     const handle = await fsp.open(tempPath, "r");
     let hash = "";
@@ -356,14 +395,9 @@ export async function importAttachmentFile(
         const { bytesRead } = await handle.read(probe, 0, probe.length, 0);
         detected = detectMimeType(probe.subarray(0, bytesRead));
       }
-      const hasher = createHash("sha256");
-      const stream = handle.createReadStream();
-      await new Promise<void>((resolve, reject) => {
-        stream.on("data", (chunk) => hasher.update(chunk));
-        stream.on("error", reject);
-        stream.on("end", () => resolve());
-      });
-      hash = hasher.digest("hex");
+      options.signal?.throwIfAborted();
+      hash = await hashImportFileSha256(tempPath, options.signal);
+      options.signal?.throwIfAborted();
     } finally {
       await handle.close();
     }
@@ -374,8 +408,10 @@ export async function importAttachmentFile(
 
     const declared = reference.mime_type ?? downloaded.contentType;
     const status = mimeTypeStatus(declared, detected);
+    options.signal?.throwIfAborted();
     const existedBefore = fs.existsSync(resolved.absPath);
     const replaced = await withFileWriteLocks([resolved.absPath], async () => {
+      options.signal?.throwIfAborted();
       if (!overwrite && existedBefore) {
         throw new CodexProError(`Destination already exists and overwrite=false: ${resolved.relPath}`);
       }

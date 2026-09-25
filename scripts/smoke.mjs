@@ -658,7 +658,7 @@ for (const [name, args] of [
   ['read_handoff', { workspace_id: alternate.structuredContent.workspace_id }],
   ['codex_context', { workspace_id: alternate.structuredContent.workspace_id }]
 ]) {
-  await assertTerminalTool(name, args, 'EXPIRED');
+  await assertTerminalTool(name, args, 'STOPPED');
 }
 
 const expiredSuperRead = await client.request('tools/call', {
@@ -671,7 +671,7 @@ const expiredSuperRead = await client.request('tools/call', {
 if (
   !expiredSuperRead.isError ||
   expiredSuperRead.structuredContent?.must_stop !== true ||
-  expiredSuperRead.structuredContent?.work_window_state !== 'EXPIRED'
+  expiredSuperRead.structuredContent?.work_window_state !== 'STOPPED'
 ) {
   throw new Error(`supertool expired read bypassed continuation latch: ${JSON.stringify(expiredSuperRead)}`);
 }
@@ -682,7 +682,7 @@ const expiredOpen = await client.request('tools/call', {
 });
 assertTerminalOrientation(
   expiredOpen,
-  'EXPIRED',
+  'STOPPED',
   alternate.structuredContent.workspace_id,
   alternate.structuredContent.root
 );
@@ -692,7 +692,7 @@ const expiredSuperOpen = await client.request('tools/call', {
 });
 assertTerminalOrientation(
   expiredSuperOpen,
-  'EXPIRED',
+  'STOPPED',
   alternate.structuredContent.workspace_id,
   alternate.structuredContent.root
 );
@@ -709,9 +709,12 @@ const expiredStatus = await client.request('tools/call', {
 });
 if (
   expiredStatus.isError ||
-  expiredStatus.structuredContent?.work_window_state !== 'EXPIRED' ||
+  expiredStatus.structuredContent?.work_window_state !== 'STOPPED' ||
+  expiredStatus.structuredContent?.state !== 'STOPPED' ||
+  expiredStatus.structuredContent?.stop_reason !== 'DEADLINE_AUTO' ||
+  expiredStatus.structuredContent?.stopped_at !== new Date(expiredDeadlineMs).toISOString() ||
   expiredStatus.structuredContent?.must_stop !== true ||
-  expiredStatus.structuredContent?.checkpoint_required !== true
+  expiredStatus.structuredContent?.checkpoint_required !== false
 ) {
   throw new Error(`terminal work_window_status metadata mismatch: ${JSON.stringify(expiredStatus)}`);
 }
@@ -728,7 +731,10 @@ const expiredCheckpoint = await client.request('tools/call', {
 if (
   expiredCheckpoint.isError ||
   expiredCheckpoint.structuredContent?.state !== 'STOPPED' ||
+  expiredCheckpoint.structuredContent?.stop_reason !== 'DEADLINE_AUTO' ||
+  expiredCheckpoint.structuredContent?.stopped_at !== new Date(expiredDeadlineMs).toISOString() ||
   expiredCheckpoint.structuredContent?.must_stop !== true ||
+  expiredCheckpoint.structuredContent?.checkpoint_required !== false ||
   expiredCheckpoint.structuredContent?.deadline !== new Date(expiredDeadlineMs).toISOString()
 ) {
   throw new Error(`EXPIRED checkpoint did not atomically STOP: ${JSON.stringify(expiredCheckpoint)}`);

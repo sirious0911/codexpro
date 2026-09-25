@@ -8,6 +8,7 @@ export const WORK_WINDOW_DURATION_MS = 30 * 60 * 1000;
 export const WORK_WINDOW_ACTIVE_MS = 27 * 60 * 1000;
 export const WORK_WINDOW_REPORT_RESERVE_MS = WORK_WINDOW_DURATION_MS - WORK_WINDOW_ACTIVE_MS;
 export const WORK_WINDOW_MIN_BASH_BUDGET_MS = 1000;
+export const WORK_WINDOW_MIN_SUBSTANTIVE_BUDGET_MS = 1000;
 
 const WORK_WINDOW_VERSION = 1;
 const HOST_RECORD_VERSION = 1;
@@ -29,6 +30,7 @@ class WorkWindowError extends Error {
 }
 
 export type WorkWindowState = "ACTIVE" | "DRAINING" | "EXPIRED" | "STOPPED";
+export type WorkWindowStopReason = "MANUAL" | "CHECKPOINT_TERMINAL" | "DEADLINE_AUTO";
 
 export interface WorkWindowCheckpoint {
   completed: string[];
@@ -55,6 +57,7 @@ export interface WorkWindowRecord {
   session_binding?: string;
   stopped_at?: string;
   stopped_at_ms?: number;
+  stop_reason?: WorkWindowStopReason;
   checkpoint?: WorkWindowCheckpoint;
 }
 
@@ -74,6 +77,7 @@ export interface WorkWindowStatus {
   remaining_to_deadline_ms: number;
   stopped_at?: string;
   stopped_at_kst?: string;
+  stop_reason?: WorkWindowStopReason;
   checkpoint?: WorkWindowCheckpoint;
   session_binding?: string;
 }
@@ -82,6 +86,8 @@ export interface WorkWindowGuardOptions {
   homeDir?: string;
   now?: () => number;
   uuid?: () => string;
+  setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout;
+  clearTimer?: (timer: NodeJS.Timeout) => void;
 }
 
 interface HostRecord {
@@ -253,7 +259,13 @@ function validateWindowRecord(value: unknown, pathname: string): WorkWindowRecor
     if (!Number.isFinite(record.stopped_at_ms) || record.stopped_at !== iso(record.stopped_at_ms)) {
       throw new WorkWindowError(`Corrupt Work Window stopped metadata: ${pathname}`);
     }
-  } else if (record.stopped_at !== undefined) {
+    if (
+      record.stop_reason !== undefined &&
+      !["MANUAL", "CHECKPOINT_TERMINAL", "DEADLINE_AUTO"].includes(record.stop_reason)
+    ) {
+      throw new WorkWindowError(`Corrupt Work Window stop_reason: ${pathname}`);
+    }
+  } else if (record.stopped_at !== undefined || record.stop_reason !== undefined) {
     throw new WorkWindowError(`Corrupt Work Window stopped metadata: ${pathname}`);
   }
   if (record.session_binding !== undefined) {
@@ -299,6 +311,11 @@ export class WorkWindowGuard {
   private readonly rootDir: string;
   private readonly hostPath: string;
   private readonly windowsDir: string;
+  private readonly setTimer: (callback: () => void, delayMs: number) => NodeJS.Timeout;
+  private readonly clearTimer: (timer: NodeJS.Timeout) => void;
+  private readonly deadlineTimers = new Map<string, NodeJS.Timeout>();
+  private initialization?: Promise<void>;
+  private deadlineTerminalizationError?: unknown;
 
   constructor(options: WorkWindowGuardOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -308,6 +325,100 @@ export class WorkWindowGuard {
       : path.join(codexProHome(), "work-windows");
     this.hostPath = path.join(this.rootDir, "host.json");
     this.windowsDir = path.join(this.rootDir, "windows");
+    this.setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
+  }
+
+  async initialize(): Promise<void> {
+    if (!this.initialization) {
+      this.initialization = this.recoverAndScheduleDeadlines();
+    }
+    await this.initialization;
+    if (this.deadlineTerminalizationError) throw this.deadlineTerminalizationError;
+  }
+
+  private clearDeadlineTimer(workWindowId: string): void {
+    const timer = this.deadlineTimers.get(workWindowId);
+    if (!timer) return;
+    this.clearTimer(timer);
+    this.deadlineTimers.delete(workWindowId);
+  }
+
+  private scheduleDeadlineTimer(record: WorkWindowRecord): void {
+    this.clearDeadlineTimer(record.work_window_id);
+    if (record.stopped_at_ms !== undefined) return;
+    const delayMs = Math.max(0, record.deadline_ms - this.now());
+    const timer = this.setTimer(() => {
+      void this.terminalizeDeadline(record.work_window_id).catch((error) => {
+        this.deadlineTerminalizationError = error;
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.deadlineTimers.set(record.work_window_id, timer);
+  }
+
+  private async terminalizeDeadline(workWindowId: string): Promise<void> {
+    const pathname = this.windowPath(workWindowId);
+    await withWindowLock(pathname, async () => {
+      const host = await this.readExistingHost();
+      if (!host) return;
+      const raw = await readJson(pathname);
+      if (raw === undefined) {
+        this.clearDeadlineTimer(workWindowId);
+        return;
+      }
+      const record = validateWindowRecord(raw, pathname);
+      if (record.host_id !== host.host_id) {
+        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+      }
+      if (record.stopped_at_ms !== undefined) {
+        this.clearDeadlineTimer(workWindowId);
+        return;
+      }
+      const nowMs = this.now();
+      if (nowMs < record.deadline_ms) {
+        this.scheduleDeadlineTimer(record);
+        return;
+      }
+      record.stopped_at_ms = record.deadline_ms;
+      record.stopped_at = record.deadline;
+      record.stop_reason = "DEADLINE_AUTO";
+      await atomicWriteJson(pathname, record);
+      this.clearDeadlineTimer(workWindowId);
+    });
+  }
+
+  private async recoverAndScheduleDeadlines(): Promise<void> {
+    const host = await this.readExistingHost();
+    if (!host) return;
+    let names: string[];
+    try {
+      names = await fsp.readdir(this.windowsDir);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    const recordNames = names.filter((name) => name.endsWith(".json")).sort();
+    if (recordNames.length > MAX_WINDOW_RECORDS) {
+      throw new WorkWindowError(`Work Window registry exceeds bounded limit of ${MAX_WINDOW_RECORDS} records.`);
+    }
+    for (const name of recordNames) {
+      const id = name.slice(0, -5);
+      assertUuid(id, "work_window_id");
+      const pathname = path.join(this.windowsDir, name);
+      const raw = await readJson(pathname);
+      if (raw === undefined) continue;
+      const record = validateWindowRecord(raw, pathname);
+      if (record.host_id !== host.host_id) {
+        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+      }
+      if (record.stopped_at_ms !== undefined) continue;
+      if (this.now() >= record.deadline_ms) {
+        await this.terminalizeDeadline(record.work_window_id);
+      } else {
+        this.scheduleDeadlineTimer(record);
+      }
+    }
   }
 
   registryRoot(): string {
@@ -357,6 +468,7 @@ export class WorkWindowGuard {
   }
 
   private async loadWindow(workWindowId: string): Promise<{ host: HostRecord; record: WorkWindowRecord }> {
+    await this.initialize();
     const normalized = assertUuid(workWindowId, "work_window_id");
     const host = await this.readExistingHost();
     if (!host) throw new WorkWindowError("Work Window host identity is not initialized.");
@@ -387,7 +499,11 @@ export class WorkWindowGuard {
       remaining_to_drain_ms: Math.max(0, Math.floor(record.drain_at_ms - nowMs)),
       remaining_to_deadline_ms: Math.max(0, Math.floor(record.deadline_ms - nowMs)),
       ...(record.stopped_at
-        ? { stopped_at: record.stopped_at, stopped_at_kst: kst(record.stopped_at_ms as number) }
+        ? {
+            stopped_at: record.stopped_at,
+            stopped_at_kst: kst(record.stopped_at_ms as number),
+            ...(record.stop_reason ? { stop_reason: record.stop_reason } : {})
+          }
         : {}),
       ...(record.checkpoint ? { checkpoint: record.checkpoint } : {}),
       ...(record.session_binding ? { session_binding: record.session_binding } : {})
@@ -395,6 +511,7 @@ export class WorkWindowGuard {
   }
 
   private async workspaceRecords(workspace: Workspace): Promise<WorkWindowRecord[]> {
+    await this.initialize();
     const host = await this.readExistingHost();
     if (!host) return [];
     let names: string[];
@@ -415,9 +532,15 @@ export class WorkWindowGuard {
       const pathname = path.join(this.windowsDir, name);
       const raw = await readJson(pathname);
       if (raw === undefined) continue;
-      const record = validateWindowRecord(raw, pathname);
+      let record = validateWindowRecord(raw, pathname);
       if (record.host_id !== host.host_id) {
         throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+      }
+      if (record.stopped_at_ms === undefined && this.now() >= record.deadline_ms) {
+        await this.terminalizeDeadline(record.work_window_id);
+        const reconciled = await readJson(pathname);
+        if (reconciled === undefined) continue;
+        record = validateWindowRecord(reconciled, pathname);
       }
       if (record.workspace_id === workspace.id && record.workspace_root === workspace.root) records.push(record);
     }
@@ -493,6 +616,7 @@ export class WorkWindowGuard {
         throw new WorkWindowError(`Work Window id collision: ${workWindowId}`);
       }
       await atomicWriteJson(pathname, record);
+      this.scheduleDeadlineTimer(record);
       return this.statusFrom(record, nowMs);
     });
   }
@@ -527,9 +651,6 @@ export class WorkWindowGuard {
     return withWindowLock(pathname, async () => {
       const { record } = await this.loadWindow(workWindowId);
       assertWorkspace(record, workspace);
-      if (record.stopped_at_ms !== undefined) {
-        throw new WorkWindowError(`Work Window is stopped: ${record.work_window_id}`);
-      }
       const nowMs = this.now();
       const stateBeforeCheckpoint = evaluateState(record, nowMs);
       record.checkpoint = {
@@ -541,11 +662,16 @@ export class WorkWindowGuard {
         test_not_run: boundedList(input.testNotRun, "test_not_run"),
         updated_at: iso(nowMs)
       };
-      if (stateBeforeCheckpoint === "DRAINING" || stateBeforeCheckpoint === "EXPIRED") {
+      if (
+        record.stopped_at_ms === undefined &&
+        (stateBeforeCheckpoint === "DRAINING" || stateBeforeCheckpoint === "EXPIRED")
+      ) {
         record.stopped_at_ms = nowMs;
         record.stopped_at = iso(nowMs);
+        record.stop_reason = "CHECKPOINT_TERMINAL";
       }
       await atomicWriteJson(pathname, record);
+      if (record.stopped_at_ms !== undefined) this.clearDeadlineTimer(record.work_window_id);
       return this.statusFrom(record, nowMs);
     });
   }
@@ -559,7 +685,9 @@ export class WorkWindowGuard {
         const nowMs = this.now();
         record.stopped_at_ms = nowMs;
         record.stopped_at = iso(nowMs);
+        record.stop_reason = "MANUAL";
         await atomicWriteJson(pathname, record);
+        this.clearDeadlineTimer(record.work_window_id);
         return this.statusFrom(record, nowMs);
       }
       return this.statusFrom(record);

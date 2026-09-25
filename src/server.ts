@@ -43,7 +43,11 @@ import { runLocalRuntimeProbeOperator } from "./localRuntimeProbeOperator.js";
 import { runWindowsSystemSnapshotOperator } from "./windowsSystemSnapshotOperator.js";
 import { runWindowsPowerOperator } from "./windowsPowerOperator.js";
 import { runWindowsDesktopUiLiveOperator } from "./windowsDesktopUiLiveOperator.js";
-import { WorkWindowGuard, type WorkWindowStatus } from "./workWindowGuard.js";
+import {
+  WorkWindowGuard,
+  WORK_WINDOW_MIN_SUBSTANTIVE_BUDGET_MS,
+  type WorkWindowStatus
+} from "./workWindowGuard.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
@@ -312,16 +316,24 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
   }
 }
 
-type CodexToolHandler = (args: any) => Promise<any> | any;
+interface WorkWindowExecutionContext {
+  signal?: AbortSignal;
+  status?: WorkWindowStatus;
+}
+
+type CodexToolHandler = (args: any, context?: WorkWindowExecutionContext) => Promise<any> | any;
 
 interface WorkWindowToolGateTicket {
   workspace: Workspace;
   status?: WorkWindowStatus;
+  abortController?: AbortController;
+  drainTimer?: NodeJS.Timeout;
 }
 
 interface WorkWindowToolGate {
   before: (name: string, args: any) => Promise<WorkWindowToolGateTicket | undefined>;
   after: (name: string, args: any, result: any, ticket?: WorkWindowToolGateTicket) => Promise<any>;
+  finish: (ticket?: WorkWindowToolGateTicket) => void;
 }
 
 const workWindowToolGatesByServer = new WeakMap<object, WorkWindowToolGate>();
@@ -354,6 +366,31 @@ const WORK_WINDOW_STATE_MUTATION_TOOL_NAMES = [
   "checkpoint_work_window",
   "stop_work_window"
 ] as const;
+
+const WORK_WINDOW_LONG_RUNNING_POLICY = Object.freeze({
+  drain_abortable: new Set(["tree", "search", "import_file", "start_dedicated_chrome"]),
+  drain_clamped: new Set(["bash", "wait_for_handoff"]),
+  bounded_budget_ms: new Map<string, number>([
+    ["workspace_snapshot", 30_000],
+    ["inspect_workspace", 60_000],
+    ["load_skill", 15_000],
+    ["view_image", 15_000],
+    ["write", 5_000],
+    ["edit", 5_000],
+    ["apply_patch", 30_000],
+    ["git_status", 15_000],
+    ["git_diff", 30_000],
+    ["show_changes", 30_000],
+    ["codex_context", 15_000],
+    ["export_pro_context", 30_000],
+    ["codex_sessions", 15_000],
+    ["read_codex_session", 15_000],
+    ["search_codex_session", 30_000],
+    ["read_codex_session_around", 15_000],
+    ["handoff_to_agent", 15_000],
+    ["handoff_to_codex", 15_000]
+  ])
+});
 
 const WORK_WINDOW_GATE_EXEMPT_TOOL_NAMES = new Set<string>([
   SUPERTOOL_NAME,
@@ -655,8 +692,16 @@ function registerCodexTool(
     const validated = validateToolArgs(name, options, args);
     const gate = workWindowToolGatesByServer.get(server as object);
     const ticket = gate ? await gate.before(name, validated) : undefined;
-    const result = await handler(validated);
-    return gate ? await gate.after(name, validated, result, ticket) : result;
+    try {
+      const result = await handler(validated, {
+        signal: ticket?.abortController?.signal,
+        status: ticket?.status
+      });
+      return gate ? await gate.after(name, validated, result, ticket) : result;
+    } catch (error) {
+      gate?.finish(ticket);
+      throw error;
+    }
   };
   registerToolCompat(config, server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
@@ -678,7 +723,7 @@ function serverInstructions(config: CodexProConfig): string {
       : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
   const workWindowInstruction = config.connectionTest
     ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, or stop Work Windows."
-    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. At/after deadline, substantive workspace tools remain latched closed. Never auto-renew or self-start a replacement; only a new user work/resume message may justify a new explicit start_work_window call.";
+    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. In-flight cancellable work is aborted at drain; at deadline the durable Work Window record auto-terminalizes to STOPPED and is reconciled after restart. CodexPro cannot wake ChatGPT or send an unsolicited assistant message when that time arrives. Never auto-renew or self-start a replacement; only a new user work/resume message may justify a new explicit start_work_window call.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
@@ -1136,6 +1181,9 @@ export function createCodexProServer(
 ): McpServer {
   const workspaces = new WorkspaceManager(config, options.workspaceRegistry);
   const workWindowGuard = new WorkWindowGuard();
+  void workWindowGuard.initialize().catch((error) => {
+    console.error(`[codexpro] Work Window deadline recovery failed: ${errorText(error)}`);
+  });
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
@@ -1146,16 +1194,47 @@ export function createCodexProServer(
     return latest && latest.state !== "ACTIVE" ? annotateWorkWindowBoundary(result, latest) : result;
   };
 
+  const finishWorkWindowTicket = (ticket?: WorkWindowToolGateTicket): void => {
+    if (!ticket?.drainTimer) return;
+    clearTimeout(ticket.drainTimer);
+    ticket.drainTimer = undefined;
+  };
+
   workWindowToolGatesByServer.set(server as object, {
     before: async (name, args) => {
       if (WORK_WINDOW_GATE_EXEMPT_TOOL_NAMES.has(name)) return undefined;
       const workspace = workspaces.getWorkspace(typeof args?.workspace_id === "string" ? args.workspace_id : undefined);
       const status = await workWindowGuard.assertContinuationAllowed(workspace);
-      return { workspace, ...(status ? { status } : {}) };
+      if (!status) return { workspace };
+      const requiredBudgetMs =
+        WORK_WINDOW_LONG_RUNNING_POLICY.bounded_budget_ms.get(name) ?? WORK_WINDOW_MIN_SUBSTANTIVE_BUDGET_MS;
+      if (status.remaining_to_drain_ms < requiredBudgetMs) {
+        throw new CodexProError(
+          `Work Window ${status.work_window_id} has less than ${requiredBudgetMs} ms ACTIVE budget remaining for ${name}; the tool was not started.`
+        );
+      }
+      if (
+        WORK_WINDOW_LONG_RUNNING_POLICY.drain_clamped.has(name) ||
+        !WORK_WINDOW_LONG_RUNNING_POLICY.drain_abortable.has(name)
+      ) {
+        return { workspace, status };
+      }
+      const abortController = new AbortController();
+      const drainTimer = setTimeout(() => {
+        abortController.abort(
+          new CodexProError(
+            `Work Window ${status.work_window_id} reached DRAINING; the in-flight ${name} operation was cancelled.`
+          )
+        );
+      }, status.remaining_to_drain_ms);
+      drainTimer.unref();
+      return { workspace, status, abortController, drainTimer };
     },
     after: async (_name, _args, result, ticket) => {
+      finishWorkWindowTicket(ticket);
       return ticket ? await applyPostflightWorkWindowBoundary(ticket.workspace, result) : result;
-    }
+    },
+    finish: finishWorkWindowTicket
   });
 
   registerToolCardResource(server, config);
@@ -1378,10 +1457,11 @@ export function createCodexProServer(
       },
       annotations: LOCAL_PROCESS_START_ANNOTATIONS
     },
-    async (args) => {
+    async (args, context) => {
       const result = await runDedicatedChromeStart({
         confirm: String(args.confirm ?? ""),
-        dryRun: args.dry_run !== false
+        dryRun: args.dry_run !== false,
+        signal: context?.signal
       });
       return textResult(
         `# Dedicated Chrome Start\n\nStatus: ${result.status}\nExecutable: ${result.executable}\nProfile: ${result.profile}\nCDP: ${result.cdpEndpoint}\nCDP ready: ${String(result.cdpReady)}\nLaunch attempted: ${String(result.launchAttempted)}\nLaunch count: ${result.launchCount}\nArgs: ${result.args.join(" ")}`,
@@ -2315,13 +2395,14 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "Workspace files listed"
       }
     },
-    async (args) => {
+    async (args, context) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const result = await repoTree(config, guard, workspace, {
         path: args.path ?? ".",
         maxDepth: limitInt(args.max_depth, 4, 1, 12),
         includeHidden: parseBool(args.include_hidden, false),
-        maxEntries: limitInt(args.max_entries, 800, 1, 3000)
+        maxEntries: limitInt(args.max_entries, 800, 1, 3000),
+        signal: context?.signal
       });
       return textResult(result.text, { workspace_id: workspace.id, root: workspace.root, ...result });
     }
@@ -2353,7 +2434,7 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "Workspace search complete"
       }
     },
-    async (args) => {
+    async (args, context) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const result = await searchWorkspace(config, guard, workspace, {
         query: args.query,
@@ -2364,7 +2445,8 @@ export function createCodexProServer(
         maxResults: limitInt(args.max_results, config.maxSearchResults, 1, config.maxSearchResults),
         intent: args.intent,
         symbol: args.symbol,
-        includeTests: args.include_tests === undefined ? undefined : parseBool(args.include_tests, false)
+        includeTests: args.include_tests === undefined ? undefined : parseBool(args.include_tests, false),
+        signal: context?.signal
       });
       const structured: Record<string, unknown> = {
         workspace_id: workspace.id,
@@ -2777,7 +2859,7 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "Attachment imported"
       }
     },
-    async (args) => {
+    async (args, context) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const resolved = guard.resolve(workspace, args.destination, { forWrite: true });
       assertWriteToolAllowed(config, resolved.relPath);
@@ -2786,7 +2868,8 @@ export function createCodexProServer(
         file: args.file,
         destination: String(args.destination ?? ""),
         overwrite: args.overwrite === true,
-        expectedSha256: args.expected_sha256
+        expectedSha256: args.expected_sha256,
+        signal: context?.signal
       });
       invalidateWorkspaceAnalysis(workspace.id);
       const text = [
@@ -3146,7 +3229,8 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "Local handoff state ready"
       }
     },
-    async (args) => {
+    async (args, context) => {
+      context?.signal?.throwIfAborted();
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const workWindowStatus = await workWindowGuard.assertContinuationAllowed(workspace);
       const maxWaitSeconds = limitInt(args.max_wait_seconds, 20, 1, 60);
@@ -3207,9 +3291,30 @@ export function createCodexProServer(
         ? pollStartedAt + workWindowStatus.remaining_to_drain_ms
         : Number.POSITIVE_INFINITY;
       const deadline = Math.min(requestedDeadline, drainDeadline);
+      const waitPoll = async (delayMs: number): Promise<void> => {
+        context?.signal?.throwIfAborted();
+        if (!context?.signal) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          return;
+        }
+        await new Promise<void>((resolve, reject) => {
+          const signal = context.signal as AbortSignal;
+          const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal.reason instanceof Error ? signal.reason : new CodexProError("Work Window drain cancelled wait_for_handoff."));
+          };
+          const timer = setTimeout(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+          }, delayMs);
+          timer.unref();
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+      };
       let state = await readState();
       while (Date.now() < deadline && !isAwaited(state)) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+        await waitPoll(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+        context?.signal?.throwIfAborted();
         state = await readState();
       }
 

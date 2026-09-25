@@ -138,20 +138,25 @@ try {
   assert.equal((await guard.listActive(workspaceB)).some((item) => item.work_window_id === cross.work_window_id), true);
   assert.equal((await guard.listActive(workspaceA)).some((item) => item.work_window_id === cross.work_window_id), false);
 
-  // H. Exact deadline is terminal; EXPIRED checkpoint becomes STOPPED in the same durable update.
+  // H. Exact deadline is terminal; reconciliation durably auto-stops and checkpoint remains writable afterward.
   const winnerStart = Date.parse(concurrentWinner.started_at);
   now = winnerStart + WORK_WINDOW_DURATION_MS;
   assert.equal((await guard.status(workspaceA, concurrentWinner.work_window_id)).state, 'EXPIRED');
-  const expiredError = await expectReject(() => guard.assertContinuationAllowed(workspaceA), /EXPIRED/);
+  const expiredError = await expectReject(() => guard.assertContinuationAllowed(workspaceA), /STOPPED/);
   assert.equal(expiredError.details?.must_stop, true);
-  assert.equal(expiredError.details?.checkpoint_required, true);
+  const autoStopped = await guard.status(workspaceA, concurrentWinner.work_window_id);
+  assert.equal(autoStopped.state, 'STOPPED');
+  assert.equal(autoStopped.stop_reason, 'DEADLINE_AUTO');
+  assert.equal(autoStopped.stopped_at, concurrentWinner.deadline);
   const expiredCheckpoint = await guard.checkpoint(workspaceA, concurrentWinner.work_window_id, {
     completed: ['active work'],
     pending: ['next user turn'],
     resumeFrom: 'STOPPED'
   });
   assert.equal(expiredCheckpoint.state, 'STOPPED');
+  assert.equal(expiredCheckpoint.stop_reason, 'DEADLINE_AUTO');
   assert.equal(expiredCheckpoint.deadline, concurrentWinner.deadline);
+  assert.deepEqual(expiredCheckpoint.checkpoint?.completed, ['active work']);
 
   // I. A fresh explicit start after terminal STOPPED restores ACTIVE and keeps bash clamped to drain.
   now += 10_000;
@@ -188,7 +193,13 @@ try {
   assert.equal(stopped.deadline, beforeStop.deadline);
   assert.equal((await guard.listActive(workspaceA)).some((item) => item.work_window_id === stopped.work_window_id), false);
   await expectReject(() => guard.assertMutationAllowed(workspaceA, stopped.work_window_id), /STOPPED/);
-  await expectReject(() => guard.checkpoint(workspaceA, stopped.work_window_id, {}), /stopped/i);
+  const stoppedCheckpoint = await guard.checkpoint(workspaceA, stopped.work_window_id, {
+    completed: ['final report'],
+    pending: []
+  });
+  assert.equal(stoppedCheckpoint.state, 'STOPPED');
+  assert.equal(stoppedCheckpoint.stop_reason, 'MANUAL');
+  assert.deepEqual(stoppedCheckpoint.checkpoint?.completed, ['final report']);
   await expectReject(() => guard.assertContinuationAllowed(workspaceA), /STOPPED/);
 
   // L. Corrupt durable state fails closed and is not silently replaced.
@@ -215,7 +226,67 @@ try {
   const hostAfter = await fs.readFile(path.join(corruptHostHome, 'host.json'), 'utf8');
   assert.match(hostAfter, /"bad"/);
 
-  console.log('work-window-guard-smoke: PASS (A-M)');
+  // N. Restart recovery durably terminalizes an overdue unstopped record at the immutable deadline.
+  const recoveryHome = path.join(tmp, 'restart-recovery');
+  let recoveryNow = 1_900_000_000_000;
+  const recoveryGuard = new WorkWindowGuard({
+    homeDir: recoveryHome,
+    now: () => recoveryNow,
+    uuid: sequenceUuid([
+      '12121212-1212-4212-8212-121212121212',
+      '13131313-1313-4313-8313-131313131313'
+    ])
+  });
+  const recoveryWindow = await recoveryGuard.start(workspaceA);
+  recoveryNow = Date.parse(recoveryWindow.deadline) + 1_000;
+  const restartedGuard = new WorkWindowGuard({ homeDir: recoveryHome, now: () => recoveryNow });
+  await restartedGuard.initialize();
+  const recoveredDeadlineStop = await restartedGuard.status(workspaceA, recoveryWindow.work_window_id);
+  assert.equal(recoveredDeadlineStop.state, 'STOPPED');
+  assert.equal(recoveredDeadlineStop.stop_reason, 'DEADLINE_AUTO');
+  assert.equal(recoveredDeadlineStop.stopped_at, recoveryWindow.deadline);
+  const recoveredCheckpoint = await restartedGuard.checkpoint(workspaceA, recoveryWindow.work_window_id, {
+    completed: ['recovered after restart'],
+    pending: ['new user turn']
+  });
+  assert.equal(recoveredCheckpoint.state, 'STOPPED');
+  assert.equal(recoveredCheckpoint.stop_reason, 'DEADLINE_AUTO');
+
+  // O. The scheduled deadline callback terminalizes without requiring another MCP request.
+  const timerHome = path.join(tmp, 'timer-terminalization');
+  let timerNow = 2_000_000_000_000;
+  let deadlineCallback;
+  let scheduledDelay = -1;
+  const timerGuard = new WorkWindowGuard({
+    homeDir: timerHome,
+    now: () => timerNow,
+    uuid: sequenceUuid([
+      '14141414-1414-4414-8414-141414141414',
+      '15151515-1515-4515-8515-151515151515'
+    ]),
+    setTimer: (callback, delayMs) => {
+      deadlineCallback = callback;
+      scheduledDelay = delayMs;
+      return { unref() {} };
+    },
+    clearTimer: () => {}
+  });
+  const timerWindow = await timerGuard.start(workspaceA);
+  assert.equal(scheduledDelay, WORK_WINDOW_DURATION_MS);
+  timerNow = Date.parse(timerWindow.deadline);
+  assert.equal(typeof deadlineCallback, 'function');
+  deadlineCallback();
+  const timerRecordPath = path.join(timerHome, 'windows', `${timerWindow.work_window_id}.json`);
+  let timerRecord;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    timerRecord = JSON.parse(await fs.readFile(timerRecordPath, 'utf8'));
+    if (timerRecord.stop_reason === 'DEADLINE_AUTO') break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(timerRecord.stop_reason, 'DEADLINE_AUTO');
+  assert.equal(timerRecord.stopped_at, timerWindow.deadline);
+
+  console.log('work-window-guard-smoke: PASS (A-O)');
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });
 }

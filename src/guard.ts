@@ -250,8 +250,10 @@ export class PathGuard {
     return { absPath, relPath };
   }
 
-  async assertTextFile(absPath: string, maxBytes: number): Promise<void> {
+  async assertTextFile(absPath: string, maxBytes: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const stat = await fsp.stat(absPath);
+    signal?.throwIfAborted();
     if (!stat.isFile()) {
       throw new CodexProError(`Not a file: ${absPath}`);
     }
@@ -264,7 +266,9 @@ export class PathGuard {
       const sample = Buffer.alloc(Math.min(64 * 1024, stat.size));
       let offset = 0;
       while (offset < stat.size) {
+        signal?.throwIfAborted();
         const { bytesRead } = await handle.read(sample, 0, sample.length, offset);
+        signal?.throwIfAborted();
         if (bytesRead === 0) break;
         if (sample.subarray(0, bytesRead).includes(0)) {
           throw new CodexProError("Refusing to read binary file.");

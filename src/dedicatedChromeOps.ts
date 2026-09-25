@@ -16,6 +16,7 @@ export const DEDICATED_CHROME_CDP_READINESS_INTERVAL_MS = 150 as const;
 export interface DedicatedChromeStartOptions {
   confirm: string;
   dryRun?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface DedicatedChromeStartPlan {
@@ -186,6 +187,7 @@ export class DedicatedChromeStartController {
   constructor(private readonly runtime: DedicatedChromeRuntime = defaultDedicatedChromeRuntime) {}
 
   async run(options: DedicatedChromeStartOptions): Promise<DedicatedChromeStartResult> {
+    options.signal?.throwIfAborted();
     const plan = buildDedicatedChromeStartPlan(options, this.runtime.platform);
     if (plan.dryRun) {
       return {
@@ -199,6 +201,7 @@ export class DedicatedChromeStartController {
     }
 
     if (await this.runtime.probeCdp()) {
+      options.signal?.throwIfAborted();
       return {
         ...plan,
         status: "ALREADY_HEALTHY",
@@ -216,17 +219,21 @@ export class DedicatedChromeStartController {
       throw new Error(`Canonical Chrome executable not found: ${plan.executable}`);
     }
 
+    options.signal?.throwIfAborted();
     this.actualStartAttempted = true;
     let pid: number | null;
     try {
       pid = await this.runtime.launch(plan);
+      options.signal?.throwIfAborted();
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Dedicated Chrome launch attempt failed; automatic retry is forbidden. ${detail}`);
     }
 
     for (let attempt = 0; attempt < DEDICATED_CHROME_CDP_READINESS_ATTEMPTS; attempt += 1) {
+      options.signal?.throwIfAborted();
       if (await this.runtime.probeCdp()) {
+        options.signal?.throwIfAborted();
         return {
           ...plan,
           status: "READY",
@@ -238,6 +245,7 @@ export class DedicatedChromeStartController {
       }
       if (attempt + 1 < DEDICATED_CHROME_CDP_READINESS_ATTEMPTS) {
         await this.runtime.sleep(DEDICATED_CHROME_CDP_READINESS_INTERVAL_MS);
+        options.signal?.throwIfAborted();
       }
     }
 

@@ -13,6 +13,7 @@ export interface TreeOptions {
   maxDepth: number;
   includeHidden: boolean;
   maxEntries: number;
+  signal?: AbortSignal;
 }
 
 export interface TreeResult {
@@ -220,8 +221,10 @@ function isHiddenName(name: string): boolean {
 }
 
 export async function repoTree(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
+  options.signal?.throwIfAborted();
   const target = guard.resolve(workspace, options.path ?? ".");
   const stat = await fsp.stat(target.absPath);
+  options.signal?.throwIfAborted();
   if (!stat.isDirectory()) {
     throw new CodexProError(`Not a directory: ${target.relPath}`);
   }
@@ -231,8 +234,10 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
   let truncated = false;
 
   async function walk(absDir: string, relDir: string, depth: number, prefix: string): Promise<void> {
+    options.signal?.throwIfAborted();
     if (depth >= options.maxDepth || truncated) return;
     let dirents = await fsp.readdir(absDir, { withFileTypes: true });
+    options.signal?.throwIfAborted();
     dirents = dirents
       .filter((entry) => options.includeHidden || !isHiddenName(entry.name))
       .filter((entry) => !guard.isBlockedRelativePath(normalizeRelPath(path.join(relDir, entry.name))))
@@ -243,6 +248,7 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
       });
 
     for (let i = 0; i < dirents.length; i += 1) {
+      options.signal?.throwIfAborted();
       if (entries >= options.maxEntries) {
         truncated = true;
         return;
@@ -271,10 +277,12 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
 export async function listFiles(
   guard: PathGuard,
   workspace: Workspace,
-  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number }
+  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number; signal?: AbortSignal }
 ): Promise<string[]> {
+  options.signal?.throwIfAborted();
   const target = guard.resolve(workspace, options.root ?? ".");
   const stat = await fsp.stat(target.absPath);
+  options.signal?.throwIfAborted();
   const files: string[] = [];
 
   async function addFile(absFile: string): Promise<void> {
@@ -286,15 +294,18 @@ export async function listFiles(
   }
 
   async function walk(absDir: string): Promise<void> {
+    options.signal?.throwIfAborted();
     if (files.length >= options.maxFiles) return;
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(absDir, { withFileTypes: true });
+      options.signal?.throwIfAborted();
     } catch {
       return;
     }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
+      options.signal?.throwIfAborted();
       if (files.length >= options.maxFiles) return;
       const abs = path.join(absDir, entry.name);
       const rel = displayPath(abs, workspace.root);

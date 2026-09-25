@@ -18,6 +18,7 @@ export interface SearchOptions {
   intent?: AnalysisSearchIntent;
   symbol?: string;
   includeTests?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface SearchResult {
@@ -117,7 +118,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   args.push("-e", options.query, "--", target.absPath);
 
   return new Promise((resolve, reject) => {
-    const child = spawn("rg", args, { cwd: workspace.root, env: { ...process.env, NO_COLOR: "1" } });
+    const child = spawn("rg", args, { cwd: workspace.root, env: { ...process.env, NO_COLOR: "1" }, signal: options.signal });
     let stdout = "";
     let stderr = "";
     let outputLimited = false;
@@ -131,7 +132,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
     child.stderr.on("data", (chunk) => {
       stderr += String(chunk);
     });
-    child.on("error", reject);
+    child.on("error", (error) => reject(options.signal?.aborted && options.signal.reason instanceof Error ? options.signal.reason : error));
     child.on("close", (code) => {
       if (code && code > 1) {
         reject(new CodexProError(stderr.trim() || `ripgrep failed with exit code ${code}`));
@@ -175,12 +176,14 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     root: options.root,
     glob: options.glob,
     includeHidden: options.includeHidden,
-    maxFiles: 20_000
+    maxFiles: 20_000,
+    signal: options.signal
   });
   const matches: Array<{ path: string; line: number; text: string }> = [];
   let visibleMatches = 0;
   const scanBytes = textScanByteLimit(config);
   for (const rel of files) {
+    options.signal?.throwIfAborted();
     if (visibleMatches > options.maxResults) break;
     const resolved = guard.resolve(workspace, rel);
     try {
@@ -220,10 +223,13 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     maxResults: Math.max(1, Math.min(rawOptions.maxResults ?? config.maxSearchResults, config.maxSearchResults)),
     intent: rawOptions.intent,
     symbol: rawOptions.symbol,
-    includeTests: rawOptions.includeTests
+    includeTests: rawOptions.includeTests,
+    signal: rawOptions.signal
   };
+  rawOptions.signal?.throwIfAborted();
   let lexical: SearchResult;
   const backend = await searchBackendStatus();
+  rawOptions.signal?.throwIfAborted();
   if (backend.ripgrep_available) {
     lexical = await runRipgrep(config, guard, workspace, options);
   } else if (options.regex) {
@@ -233,6 +239,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
   }
   const structuredRequested = rawOptions.intent !== undefined || rawOptions.symbol !== undefined || rawOptions.includeTests !== undefined;
   if (!structuredRequested) return lexical;
+  rawOptions.signal?.throwIfAborted();
   if (!config.analysisEnabled) {
     lexical.analysis = {
       schemaVersion: 1,
@@ -253,9 +260,14 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       includeTests: Boolean(rawOptions.includeTests),
       regex: Boolean(rawOptions.regex),
       root: options.root,
-      maxResults: options.maxResults
+      maxResults: options.maxResults,
+      signal: rawOptions.signal
     });
+    rawOptions.signal?.throwIfAborted();
   } catch (error) {
+    if (rawOptions.signal?.aborted) {
+      throw rawOptions.signal.reason instanceof Error ? rawOptions.signal.reason : error;
+    }
     lexical.analysis = {
       schemaVersion: 1,
       query,

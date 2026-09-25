@@ -174,6 +174,46 @@ try {
   assert.equal(candidateLimited.coverage.truncated, true);
   assert(candidateLimited.warnings.some((warning) => warning.includes('retained the first 8 candidates')));
 
+  const abortRoot = path.join(tmp, 'abort-fixture');
+  await fs.mkdir(abortRoot, { recursive: true });
+  const abortWrites = [];
+  for (let index = 0; index < 600; index += 1) {
+    abortWrites.push(
+      fs.writeFile(
+        path.join(abortRoot, `file-${String(index).padStart(4, '0')}.ts`),
+        `export function abortTarget${index}() { return 'structured abort marker ${index}'; }
+`.repeat(30),
+        'utf8'
+      )
+    );
+  }
+  await Promise.all(abortWrites);
+  analysisApi.invalidateWorkspaceAnalysis(workspace.id);
+  const structuredAbort = new AbortController();
+  const structuredAbortReason = new Error('structured-search-drain-abort');
+  const structuredAbortPromise = analysisApi.searchWorkspaceStructured(config, guard, workspace, {
+    query: 'structured abort marker',
+    intent: 'symbol',
+    includeTests: true,
+    signal: structuredAbort.signal
+  });
+  setTimeout(() => structuredAbort.abort(structuredAbortReason), 1);
+  await assert.rejects(structuredAbortPromise, (error) => error === structuredAbortReason);
+  assert.equal(structuredAbort.signal.aborted, true);
+
+  const searchOps = await importBuilt('searchOps.js');
+  analysisApi.invalidateWorkspaceAnalysis(workspace.id);
+  const wrappedAbort = new AbortController();
+  const wrappedAbortReason = new Error('wrapped-structured-search-drain-abort');
+  const wrappedAbortPromise = searchOps.searchWorkspace(config, guard, workspace, {
+    query: 'structured abort marker',
+    intent: 'symbol',
+    includeTests: true,
+    signal: wrappedAbort.signal
+  });
+  setTimeout(() => wrappedAbort.abort(wrappedAbortReason), 5);
+  await assert.rejects(wrappedAbortPromise, (error) => error === wrappedAbortReason);
+
   console.log('✓ analysis smoke test passed');
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });

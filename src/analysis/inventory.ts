@@ -6,18 +6,32 @@ import type { PathGuard, Workspace } from "../guard.js";
 import { classifyFileRole, classifyLanguage, isEntrypoint, isGeneratedFile } from "./classify.js";
 import type { InventoryFile, InventoryResult } from "./types.js";
 
-export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<InventoryResult> {
+export async function inventoryWorkspace(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  signal?: AbortSignal
+): Promise<InventoryResult> {
+  signal?.throwIfAborted();
   const maxFiles = config.analysisLimits.maxInventoryFiles;
-  const candidates = await listFiles(guard, workspace, { root: ".", includeHidden: true, maxFiles: maxFiles + 1 });
+  const candidates = await listFiles(guard, workspace, {
+    root: ".",
+    includeHidden: true,
+    maxFiles: maxFiles + 1,
+    signal
+  });
+  signal?.throwIfAborted();
   const truncated = candidates.length > maxFiles;
   const files: InventoryFile[] = [];
 
   for (const candidate of candidates.slice(0, maxFiles)) {
+    signal?.throwIfAborted();
     try {
       const resolved = guard.resolve(workspace, candidate);
       const stat = await fsp.stat(resolved.absPath);
+      signal?.throwIfAborted();
       if (!stat.isFile()) continue;
-      await guard.assertTextFile(resolved.absPath, textScanByteLimit(config));
+      await guard.assertTextFile(resolved.absPath, textScanByteLimit(config), signal);
       const language = classifyLanguage(resolved.relPath);
       files.push({
         path: resolved.relPath,
@@ -28,7 +42,8 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
         generated: isGeneratedFile(resolved.relPath),
         entrypoint: isEntrypoint(resolved.relPath)
       });
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : error;
       // Blocked, escaping, unreadable, binary, and oversized files are absent by design.
     }
   }

@@ -26,16 +26,28 @@ function areasFor(files: WorkspaceAnalysis["files"]): WorkspaceAnalysis["areas"]
   return [...counts.entries()].map(([areaPath, value]) => ({ path: areaPath, ...value })).sort((a, b) => b.files - a.files || a.path.localeCompare(b.path));
 }
 
-export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<WorkspaceAnalysis> {
+export async function inspectWorkspace(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  signal?: AbortSignal
+): Promise<WorkspaceAnalysis> {
+  signal?.throwIfAborted();
   if (!config.analysisEnabled) throw new Error("Repository analysis is disabled by CODEXPRO_ANALYSIS=0.");
-  const inventory = await inventoryWorkspace(config, guard, workspace);
+  const inventory = await inventoryWorkspace(config, guard, workspace, signal);
+  signal?.throwIfAborted();
   const key = cacheKey(workspace, inventory.fingerprint, config);
   const cached = getCachedWorkspaceAnalysis(key);
-  if (cached) return { ...cached, cache: { hit: true, key } };
+  if (cached) {
+    signal?.throwIfAborted();
+    return { ...cached, cache: { hit: true, key } };
+  }
 
-  const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files);
+  const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files, signal);
+  signal?.throwIfAborted();
   const symbols = extraction.files.flatMap((file) => file.symbols).slice(0, config.analysisLimits.maxSymbols);
-  const relationships = buildRelationships(extraction.files, inventory.files, config.analysisLimits.maxRelationships);
+  const relationships = buildRelationships(extraction.files, inventory.files, config.analysisLimits.maxRelationships, signal);
+  signal?.throwIfAborted();
   const languages = [...new Set(inventory.files.map((file) => file.language).filter((language) => language !== "unknown"))].sort();
   const warnings = [...inventory.coverage.warnings, ...extraction.warnings];
   const result: WorkspaceAnalysis = {
@@ -71,11 +83,21 @@ export async function searchWorkspaceStructured(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
-  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; regex?: boolean; root?: string; maxResults?: number }
+  options: {
+    query: string;
+    intent?: AnalysisSearchIntent;
+    includeTests?: boolean;
+    regex?: boolean;
+    root?: string;
+    maxResults?: number;
+    signal?: AbortSignal;
+  }
 ): Promise<StructuredSearchResult> {
+  options.signal?.throwIfAborted();
   const query = options.query.trim();
   if (!query) throw new Error("query is required.");
-  const analysis = await inspectWorkspace(config, guard, workspace);
+  const analysis = await inspectWorkspace(config, guard, workspace, options.signal);
+  options.signal?.throwIfAborted();
   const intent = classifySearchIntent(query, options.intent ?? "auto", options.regex);
   const groups = emptySearchGroups();
   const lowered = query.toLowerCase();
@@ -87,6 +109,7 @@ export async function searchWorkspaceStructured(
   const inScope = (filePath: string) => !resolvedRoot || filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}/`);
   const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number]>>();
   for (const symbol of analysis.symbols) {
+    options.signal?.throwIfAborted();
     const byLine = definitionsByPath.get(symbol.path) ?? new Map<number, WorkspaceAnalysis["symbols"][number]>();
     byLine.set(symbol.line, symbol);
     definitionsByPath.set(symbol.path, byLine);
@@ -112,6 +135,7 @@ export async function searchWorkspaceStructured(
 
   scan:
   for (const file of analysis.files) {
+    options.signal?.throwIfAborted();
     if (file.generated || (!options.includeTests && file.role === "test")) continue;
     if (!inScope(file.path) && !(options.includeTests && file.role === "test")) continue;
     if (scannedFiles >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
@@ -121,8 +145,10 @@ export async function searchWorkspaceStructured(
     let text: string;
     try {
       const resolved = guard.resolve(workspace, file.path);
-      text = await fsp.readFile(resolved.absPath, "utf8");
-    } catch {
+      text = await fsp.readFile(resolved.absPath, { encoding: "utf8", signal: options.signal });
+      options.signal?.throwIfAborted();
+    } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : error;
       skippedFiles += 1;
       continue;
     }
@@ -136,6 +162,7 @@ export async function searchWorkspaceStructured(
     const definitions = definitionsByPath.get(file.path) ?? new Map();
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
+      options.signal?.throwIfAborted();
       const line = lines[index];
       if (!line.toLowerCase().includes(lowered)) continue;
       const symbol = definitions.get(index + 1);
@@ -169,6 +196,7 @@ export async function searchWorkspaceStructured(
         .map((symbol) => symbol.path)
     );
     for (const relationship of analysis.relationships) {
+      options.signal?.throwIfAborted();
       if (!definitionPaths.has(relationship.to)) continue;
       const group = relationship.kind === "tests" ? "tests" : "references";
       if (group === "tests" && !options.includeTests) continue;
@@ -199,7 +227,11 @@ export async function searchWorkspaceStructured(
 
   if (candidateLimitReached) warnings.push(`Grouped search retained the first ${candidateLimit} candidates before ranking.`);
 
-  for (const match of sortStructuredMatches(matches).slice(0, resultLimit)) groups[match.group].push(match);
+  options.signal?.throwIfAborted();
+  for (const match of sortStructuredMatches(matches).slice(0, resultLimit)) {
+    options.signal?.throwIfAborted();
+    groups[match.group].push(match);
+  }
   return {
     schemaVersion: 1,
     query,

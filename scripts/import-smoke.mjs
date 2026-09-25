@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -104,6 +105,7 @@ const workWindowHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-import-
 const {
   assertSafeImportUrl,
   detectMimeType,
+  hashImportFileSha256,
   importAttachmentFile,
   mimeTypeStatus,
   parseAttachmentFileReference
@@ -146,6 +148,18 @@ try {
     const guard = new PathGuard(config);
     const workspace = new WorkspaceManager(config).defaultWorkspace();
     const env = { ...process.env, CODEXPRO_IMPORT_ALLOW_LOOPBACK: '1' };
+
+    const hashAbortPath = path.join(root, 'hash-abort.bin');
+    await fs.writeFile(hashAbortPath, Buffer.alloc(1));
+    await fs.truncate(hashAbortPath, 50_000_000);
+    const hashAbort = new AbortController();
+    const hashAbortReason = new Error('import-hash-drain-abort');
+    assert.equal(hashAbort.signal.aborted, false);
+    const hashAbortPromise = hashImportFileSha256(hashAbortPath, hashAbort.signal);
+    setImmediate(() => hashAbort.abort(hashAbortReason));
+    await assert.rejects(hashAbortPromise, (error) => error === hashAbortReason);
+    assert.equal(hashAbort.signal.aborted, true);
+    await fs.rm(hashAbortPath, { force: true });
 
     const imported = await importAttachmentFile(config, guard, workspace, {
       file: {
