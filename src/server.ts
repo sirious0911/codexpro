@@ -43,7 +43,7 @@ import { runLocalRuntimeProbeOperator } from "./localRuntimeProbeOperator.js";
 import { runWindowsSystemSnapshotOperator } from "./windowsSystemSnapshotOperator.js";
 import { runWindowsPowerOperator } from "./windowsPowerOperator.js";
 import { runWindowsDesktopUiLiveOperator } from "./windowsDesktopUiLiveOperator.js";
-import { WorkWindowGuard } from "./workWindowGuard.js";
+import { WorkWindowGuard, type WorkWindowStatus } from "./workWindowGuard.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -103,10 +103,17 @@ function bashTextResult(config: CodexProConfig, result: Awaited<ReturnType<typeo
 }
 
 function errorResult(error: unknown): any {
+  const details =
+    error && typeof error === "object" && "details" in error &&
+    (error as { details?: unknown }).details &&
+    typeof (error as { details?: unknown }).details === "object" &&
+    !Array.isArray((error as { details?: unknown }).details)
+      ? ((error as { details: Record<string, unknown> }).details)
+      : {};
   return {
     isError: true,
     content: [{ type: "text", text: errorText(error) }],
-    structuredContent: { error: errorText(error) }
+    structuredContent: { error: errorText(error), ...details }
   };
 }
 
@@ -126,6 +133,28 @@ function validateToolArgs(name: string, options: Record<string, unknown>, args: 
     .map((issue) => `${issue.path.length ? issue.path.join(".") : "arguments"}: ${issue.message}`)
     .join("; ");
   throw new CodexProError(`Invalid arguments for ${name}: ${details}`);
+}
+
+function workWindowBoundaryFields(status: WorkWindowStatus): Record<string, unknown> {
+  return {
+    work_window_id: status.work_window_id,
+    work_window_state: status.state,
+    must_stop: status.state !== "ACTIVE",
+    checkpoint_required: status.state === "DRAINING" || status.state === "EXPIRED",
+    auto_renew_allowed: false,
+    drain_at: status.drain_at,
+    deadline: status.deadline
+  };
+}
+
+function annotateWorkWindowBoundary(result: any, status: WorkWindowStatus): any {
+  if (!result || typeof result !== "object" || status.state === "ACTIVE") return result;
+  const structured =
+    result.structuredContent && typeof result.structuredContent === "object" && !Array.isArray(result.structuredContent)
+      ? result.structuredContent
+      : {};
+  result.structuredContent = { ...structured, ...workWindowBoundaryFields(status) };
+  return result;
 }
 
 function tagToolResult(result: any, name: string, options: Record<string, unknown>): any {
@@ -244,6 +273,18 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
 
 type CodexToolHandler = (args: any) => Promise<any> | any;
 
+interface WorkWindowToolGateTicket {
+  workspace: Workspace;
+  status?: WorkWindowStatus;
+}
+
+interface WorkWindowToolGate {
+  before: (name: string, args: any) => Promise<WorkWindowToolGateTicket | undefined>;
+  after: (name: string, args: any, result: any, ticket?: WorkWindowToolGateTicket) => Promise<any>;
+}
+
+const workWindowToolGatesByServer = new WeakMap<object, WorkWindowToolGate>();
+
 const SUPERTOOL_NAME = "codexpro";
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   actions: "list_actions",
@@ -272,6 +313,19 @@ const WORK_WINDOW_STATE_MUTATION_TOOL_NAMES = [
   "checkpoint_work_window",
   "stop_work_window"
 ] as const;
+
+const WORK_WINDOW_GATE_EXEMPT_TOOL_NAMES = new Set<string>([
+  SUPERTOOL_NAME,
+  "server_config",
+  "list_workspaces",
+  "start_work_window",
+  "work_window_status",
+  "list_active_work_windows",
+  "checkpoint_work_window",
+  "stop_work_window",
+  "open_current_workspace",
+  "open_workspace"
+]);
 
 const registeredToolHandlersByServer = new WeakMap<object, Map<string, CodexToolHandler>>();
 
@@ -555,7 +609,13 @@ function registerCodexTool(
   handler: CodexToolHandler
 ): void {
   if (!shouldRegisterTool(config, name)) return;
-  const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
+  const validatedHandler: CodexToolHandler = async (args) => {
+    const validated = validateToolArgs(name, options, args);
+    const gate = workWindowToolGatesByServer.get(server as object);
+    const ticket = gate ? await gate.before(name, validated) : undefined;
+    const result = await handler(validated);
+    return gate ? await gate.after(name, validated, result, ticket) : result;
+  };
   registerToolCompat(server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
   rememberRegisteredToolHandler(server, name, validatedHandler);
@@ -576,7 +636,7 @@ function serverInstructions(config: CodexProConfig): string {
       : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
   const workWindowInstruction = config.connectionTest
     ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, or stop Work Windows."
-    : "6. For a new user-authorized substantive work/resume request, call start_work_window once before write/edit/apply_patch/import_file/bash and pass that explicit work_window_id to every guarded operation. A Work Window is ACTIVE for 27 minutes, DRAINING until 30 minutes, then EXPIRED. Never auto-renew or self-start a replacement; only a new user request may authorize a new Work Window.";
+    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. At/after deadline, substantive workspace tools remain latched closed. Never auto-renew or self-start a replacement; only a new user work/resume message may justify a new explicit start_work_window call.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
@@ -1036,6 +1096,24 @@ export function createCodexProServer(
   const guard = new PathGuard(config);
   const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
+
+  const applyPostflightWorkWindowBoundary = async (workspace: Workspace, result: any): Promise<any> => {
+    const latest = await workWindowGuard.latestStatus(workspace);
+    return latest && latest.state !== "ACTIVE" ? annotateWorkWindowBoundary(result, latest) : result;
+  };
+
+  workWindowToolGatesByServer.set(server as object, {
+    before: async (name, args) => {
+      if (WORK_WINDOW_GATE_EXEMPT_TOOL_NAMES.has(name)) return undefined;
+      const workspace = workspaces.getWorkspace(typeof args?.workspace_id === "string" ? args.workspace_id : undefined);
+      const status = await workWindowGuard.assertContinuationAllowed(workspace);
+      return { workspace, ...(status ? { status } : {}) };
+    },
+    after: async (_name, _args, result, ticket) => {
+      return ticket ? await applyPostflightWorkWindowBoundary(ticket.workspace, result) : result;
+    }
+  });
+
   registerToolCardResource(server, config);
 
   registerCodexTool(
@@ -1800,6 +1878,7 @@ export function createCodexProServer(
     },
     async (args) => {
       const workspace = workspaces.selectDefaultWorkspace();
+      await workWindowGuard.assertContinuationAllowed(workspace);
       const summary = await workspaceSummary(config, guard, workspace, {
         includeTree: parseBool(args.include_tree, false),
         maxDepth: limitInt(args.max_depth, 2, 1, 8),
@@ -1807,7 +1886,7 @@ export function createCodexProServer(
         includeGlobalSkills: parseBool(args.include_global_skills, false),
         bootstrapContext: false
       });
-      return textResult(summary.text, {
+      const result = textResult(summary.text, {
         workspace_id: summary.workspaceId,
         selected_workspace_id: summary.workspaceId,
         root: summary.root,
@@ -1822,6 +1901,7 @@ export function createCodexProServer(
         write_mode: config.writeMode,
         tool_mode: config.toolMode
       });
+      return await applyPostflightWorkWindowBoundary(workspace, result);
     }
   );
 
@@ -1855,6 +1935,7 @@ export function createCodexProServer(
         throw new CodexProError("open_workspace accepts either root or path. If both are provided, they must match.");
       }
       const workspace = workspaces.openWorkspace(args.root ?? args.path);
+      await workWindowGuard.assertContinuationAllowed(workspace);
       const summary = await workspaceSummary(config, guard, workspace, {
         includeTree: args.include_tree !== false,
         maxDepth: limitInt(args.max_depth, 3, 1, 8),
@@ -1863,7 +1944,7 @@ export function createCodexProServer(
         includeGlobalSkills: parseBool(args.include_global_skills, false),
         bootstrapContext: false
       });
-      return textResult(summary.text, {
+      const result = textResult(summary.text, {
         workspace_id: summary.workspaceId,
         selected_workspace_id: summary.workspaceId,
         root: summary.root,
@@ -1878,6 +1959,7 @@ export function createCodexProServer(
         write_mode: config.writeMode,
         tool_mode: config.toolMode
       });
+      return await applyPostflightWorkWindowBoundary(workspace, result);
     }
   );
 
@@ -2221,9 +2303,12 @@ export function createCodexProServer(
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const status = await workWindowGuard.status(workspace, args.work_window_id);
-      return textResult(
-        `# Work Window Status\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nDrain at: ${status.drain_at_kst}\nDeadline: ${status.deadline_kst}\nRemaining to drain: ${status.remaining_to_drain_ms} ms\nRemaining to deadline: ${status.remaining_to_deadline_ms} ms`,
-        status as unknown as Record<string, unknown>
+      return annotateWorkWindowBoundary(
+        textResult(
+          `# Work Window Status\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nDrain at: ${status.drain_at_kst}\nDeadline: ${status.deadline_kst}\nRemaining to drain: ${status.remaining_to_drain_ms} ms\nRemaining to deadline: ${status.remaining_to_deadline_ms} ms`,
+          status as unknown as Record<string, unknown>
+        ),
+        status
       );
     }
   );
@@ -2261,7 +2346,7 @@ export function createCodexProServer(
     "checkpoint_work_window",
     {
       title: "Checkpoint Work Window",
-      description: "Persist one bounded latest checkpoint for an existing Work Window. Allowed while ACTIVE, DRAINING, or EXPIRED; it does not extend deadlines and cannot mutate source.",
+      description: "Persist one bounded latest checkpoint for an existing Work Window. ACTIVE stays ACTIVE; DRAINING or EXPIRED atomically records the checkpoint and transitions the same durable window to STOPPED without extending deadlines.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id bound to the Work Window."),
         work_window_id: z.string().uuid().describe("Explicit Work Window UUID."),
@@ -2284,9 +2369,12 @@ export function createCodexProServer(
         testCompleted: args.test_completed,
         testNotRun: args.test_not_run
       });
-      return textResult(
-        `# Checkpoint Work Window\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nDeadline unchanged: ${status.deadline_kst}`,
-        status as unknown as Record<string, unknown>
+      return annotateWorkWindowBoundary(
+        textResult(
+          `# Checkpoint Work Window\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nDeadline unchanged: ${status.deadline_kst}`,
+          status as unknown as Record<string, unknown>
+        ),
+        status
       );
     }
   );
@@ -2307,9 +2395,12 @@ export function createCodexProServer(
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const status = await workWindowGuard.stop(workspace, args.work_window_id);
-      return textResult(
-        `# Stop Work Window\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nOriginal deadline: ${status.deadline_kst}`,
-        status as unknown as Record<string, unknown>
+      return annotateWorkWindowBoundary(
+        textResult(
+          `# Stop Work Window\n\nWork window: ${status.work_window_id}\nState: ${status.state}\nOriginal deadline: ${status.deadline_kst}`,
+          status as unknown as Record<string, unknown>
+        ),
+        status
       );
     }
   );
@@ -2852,6 +2943,7 @@ export function createCodexProServer(
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      const workWindowStatus = await workWindowGuard.assertContinuationAllowed(workspace);
       const maxWaitSeconds = limitInt(args.max_wait_seconds, 20, 1, 60);
       const pollMs = limitInt(args.poll_ms, 1000, 250, 5000);
       const includeDiff = parseBool(args.include_diff, true);
@@ -2886,7 +2978,12 @@ export function createCodexProServer(
             (sinceIteration === undefined || (typeof state.iteration === "number" && state.iteration > sinceIteration))
         );
 
-      const deadline = Date.now() + maxWaitSeconds * 1000;
+      const pollStartedAt = Date.now();
+      const requestedDeadline = pollStartedAt + maxWaitSeconds * 1000;
+      const drainDeadline = workWindowStatus
+        ? pollStartedAt + workWindowStatus.remaining_to_drain_ms
+        : Number.POSITIVE_INFINITY;
+      const deadline = Math.min(requestedDeadline, drainDeadline);
       let state = await readState();
       while (Date.now() < deadline && !isAwaited(state)) {
         await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now()))));

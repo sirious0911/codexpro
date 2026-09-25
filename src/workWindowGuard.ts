@@ -19,9 +19,12 @@ const MAX_SESSION_BINDING_LENGTH = 128;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 class WorkWindowError extends Error {
-  constructor(message: string) {
+  readonly details: Record<string, unknown>;
+
+  constructor(message: string, details: Record<string, unknown> = {}) {
     super(message);
     this.name = "CodexProError";
+    this.details = details;
   }
 }
 
@@ -315,6 +318,10 @@ export class WorkWindowGuard {
     return path.join(this.windowsDir, `${assertUuid(workWindowId, "work_window_id")}.json`);
   }
 
+  private workspaceLockKey(workspace: Workspace): string {
+    return path.join(this.windowsDir, `.workspace-${workspace.id}`);
+  }
+
   private async readExistingHost(): Promise<HostRecord | undefined> {
     const raw = await readJson(this.hostPath);
     return raw === undefined ? undefined : validateHostRecord(raw, this.hostPath);
@@ -387,29 +394,101 @@ export class WorkWindowGuard {
     };
   }
 
+  private async workspaceRecords(workspace: Workspace): Promise<WorkWindowRecord[]> {
+    const host = await this.readExistingHost();
+    if (!host) return [];
+    let names: string[];
+    try {
+      names = await fsp.readdir(this.windowsDir);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return [];
+      throw error;
+    }
+    const recordNames = names.filter((name) => name.endsWith(".json")).sort();
+    if (recordNames.length > MAX_WINDOW_RECORDS) {
+      throw new WorkWindowError(`Work Window registry exceeds bounded limit of ${MAX_WINDOW_RECORDS} records.`);
+    }
+    const records: WorkWindowRecord[] = [];
+    for (const name of recordNames) {
+      const id = name.slice(0, -5);
+      assertUuid(id, "work_window_id");
+      const pathname = path.join(this.windowsDir, name);
+      const raw = await readJson(pathname);
+      if (raw === undefined) continue;
+      const record = validateWindowRecord(raw, pathname);
+      if (record.host_id !== host.host_id) {
+        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+      }
+      if (record.workspace_id === workspace.id && record.workspace_root === workspace.root) records.push(record);
+    }
+    return records.sort(
+      (a, b) => a.started_at_ms - b.started_at_ms || a.work_window_id.localeCompare(b.work_window_id)
+    );
+  }
+
+  async latestStatus(workspace: Workspace): Promise<WorkWindowStatus | undefined> {
+    const records = await this.workspaceRecords(workspace);
+    const latest = records.at(-1);
+    return latest ? this.statusFrom(latest) : undefined;
+  }
+
+  async assertContinuationAllowed(workspace: Workspace): Promise<WorkWindowStatus | undefined> {
+    const status = await this.latestStatus(workspace);
+    if (!status || status.state === "ACTIVE") return status;
+    throw new WorkWindowError(
+      `Work Window ${status.work_window_id} is ${status.state}; substantive workspace work must stop. Persist a checkpoint/STOPPED report and wait for a new explicit start_work_window after a new user-authorized work/resume request.`,
+      {
+        work_window_id: status.work_window_id,
+        work_window_state: status.state,
+        must_stop: true,
+        checkpoint_required: status.state === "DRAINING" || status.state === "EXPIRED",
+        auto_renew_allowed: false,
+        drain_at: status.drain_at,
+        deadline: status.deadline
+      }
+    );
+  }
+
   async start(workspace: Workspace, options: { sessionBinding?: string } = {}): Promise<WorkWindowStatus> {
-    const host = await this.ensureHost();
-    const nowMs = this.now();
-    const workWindowId = assertUuid(this.uuid(), "work_window_id");
-    const sessionBinding = options.sessionBinding === undefined
-      ? undefined
-      : boundedText(options.sessionBinding, MAX_SESSION_BINDING_LENGTH, "session_binding");
-    const record: WorkWindowRecord = {
-      version: 1,
-      host_id: host.host_id,
-      work_window_id: workWindowId,
-      workspace_id: workspace.id,
-      workspace_root: workspace.root,
-      started_at: iso(nowMs),
-      started_at_ms: nowMs,
-      drain_at: iso(nowMs + WORK_WINDOW_ACTIVE_MS),
-      drain_at_ms: nowMs + WORK_WINDOW_ACTIVE_MS,
-      deadline: iso(nowMs + WORK_WINDOW_DURATION_MS),
-      deadline_ms: nowMs + WORK_WINDOW_DURATION_MS,
-      ...(sessionBinding ? { session_binding: sessionBinding } : {})
-    };
-    const pathname = this.windowPath(workWindowId);
-    return withWindowLock(pathname, async () => {
+    return withWindowLock(this.workspaceLockKey(workspace), async () => {
+      const nowMs = this.now();
+      const existing = (await this.workspaceRecords(workspace))
+        .map((record) => this.statusFrom(record, nowMs))
+        .filter((status) => status.state === "ACTIVE" || status.state === "DRAINING")
+        .at(-1);
+      if (existing) {
+        throw new WorkWindowError(
+          `Work Window ${existing.work_window_id} is already ${existing.state} for this workspace; parallel continuation and auto-renewal are not allowed.`,
+          {
+            work_window_id: existing.work_window_id,
+            work_window_state: existing.state,
+            must_stop: existing.state === "DRAINING",
+            checkpoint_required: existing.state === "DRAINING",
+            auto_renew_allowed: false
+          }
+        );
+      }
+
+      const host = await this.ensureHost();
+      const workWindowId = assertUuid(this.uuid(), "work_window_id");
+      const sessionBinding = options.sessionBinding === undefined
+        ? undefined
+        : boundedText(options.sessionBinding, MAX_SESSION_BINDING_LENGTH, "session_binding");
+      const record: WorkWindowRecord = {
+        version: 1,
+        host_id: host.host_id,
+        work_window_id: workWindowId,
+        workspace_id: workspace.id,
+        workspace_root: workspace.root,
+        started_at: iso(nowMs),
+        started_at_ms: nowMs,
+        drain_at: iso(nowMs + WORK_WINDOW_ACTIVE_MS),
+        drain_at_ms: nowMs + WORK_WINDOW_ACTIVE_MS,
+        deadline: iso(nowMs + WORK_WINDOW_DURATION_MS),
+        deadline_ms: nowMs + WORK_WINDOW_DURATION_MS,
+        ...(sessionBinding ? { session_binding: sessionBinding } : {})
+      };
+      const pathname = this.windowPath(workWindowId);
       if (await readJson(pathname) !== undefined) {
         throw new WorkWindowError(`Work Window id collision: ${workWindowId}`);
       }
@@ -425,35 +504,10 @@ export class WorkWindowGuard {
   }
 
   async listActive(workspace: Workspace): Promise<WorkWindowStatus[]> {
-    const host = await this.readExistingHost();
-    if (!host) return [];
-    let names: string[];
-    try {
-      names = await fsp.readdir(this.windowsDir);
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return [];
-      throw error;
-    }
-    const recordNames = names.filter((name) => name.endsWith(".json")).sort();
-    if (recordNames.length > MAX_WINDOW_RECORDS) {
-      throw new WorkWindowError(`Work Window registry exceeds bounded limit of ${MAX_WINDOW_RECORDS} records.`);
-    }
     const nowMs = this.now();
-    const active: WorkWindowStatus[] = [];
-    for (const name of recordNames) {
-      const id = name.slice(0, -5);
-      assertUuid(id, "work_window_id");
-      const pathname = path.join(this.windowsDir, name);
-      const raw = await readJson(pathname);
-      if (raw === undefined) continue;
-      const record = validateWindowRecord(raw, pathname);
-      if (record.host_id !== host.host_id) {
-        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
-      }
-      if (record.workspace_id !== workspace.id || record.workspace_root !== workspace.root) continue;
-      const status = this.statusFrom(record, nowMs);
-      if (status.state === "ACTIVE" || status.state === "DRAINING") active.push(status);
-    }
+    const active = (await this.workspaceRecords(workspace))
+      .map((record) => this.statusFrom(record, nowMs))
+      .filter((status) => status.state === "ACTIVE" || status.state === "DRAINING");
     return active.sort((a, b) => a.started_at.localeCompare(b.started_at));
   }
 
@@ -477,6 +531,7 @@ export class WorkWindowGuard {
         throw new WorkWindowError(`Work Window is stopped: ${record.work_window_id}`);
       }
       const nowMs = this.now();
+      const stateBeforeCheckpoint = evaluateState(record, nowMs);
       record.checkpoint = {
         completed: boundedList(input.completed, "completed"),
         pending: boundedList(input.pending, "pending"),
@@ -486,6 +541,10 @@ export class WorkWindowGuard {
         test_not_run: boundedList(input.testNotRun, "test_not_run"),
         updated_at: iso(nowMs)
       };
+      if (stateBeforeCheckpoint === "DRAINING" || stateBeforeCheckpoint === "EXPIRED") {
+        record.stopped_at_ms = nowMs;
+        record.stopped_at = iso(nowMs);
+      }
       await atomicWriteJson(pathname, record);
       return this.statusFrom(record, nowMs);
     });

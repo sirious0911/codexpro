@@ -45,6 +45,7 @@ async function expectReject(fn, pattern) {
   }
   assert(error, 'expected rejection');
   if (pattern) assert.match(String(error.message ?? error), pattern);
+  return error;
 }
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-work-window-'));
@@ -59,12 +60,13 @@ const uuid = sequenceUuid();
 const guard = new WorkWindowGuard({ homeDir: registry, now: () => now, uuid });
 
 try {
-  // A. Host identity persists and start creates a fixed window.
+  // A. Host identity persists and start creates one fixed window.
+  const firstStart = now;
   const first = await guard.start(workspaceA, { sessionBinding: 'transport-a' });
   assert.equal(first.state, 'ACTIVE');
   assert.equal(first.work_window_id, UUIDS[1]);
-  assert.equal(first.drain_at, new Date(now + WORK_WINDOW_ACTIVE_MS).toISOString());
-  assert.equal(first.deadline, new Date(now + WORK_WINDOW_DURATION_MS).toISOString());
+  assert.equal(first.drain_at, new Date(firstStart + WORK_WINDOW_ACTIVE_MS).toISOString());
+  assert.equal(first.deadline, new Date(firstStart + WORK_WINDOW_DURATION_MS).toISOString());
   const hostId = first.host_id;
   const originalDeadline = first.deadline;
 
@@ -81,17 +83,20 @@ try {
   );
   await expectReject(() => guard.assertMutationAllowed(workspaceB, first.work_window_id), /different workspace/i);
 
-  // C. Exact 27-minute boundary enters DRAINING and blocks mutation.
-  now = 1_800_000_000_000 + WORK_WINDOW_ACTIVE_MS - 1;
+  // C. Exact drain boundary is terminal for substantive continuation.
+  now = firstStart + WORK_WINDOW_ACTIVE_MS - 1;
   assert.equal((await guard.status(workspaceA, first.work_window_id)).state, 'ACTIVE');
+  assert.equal((await guard.assertContinuationAllowed(workspaceA)).state, 'ACTIVE');
   now += 1;
   assert.equal((await guard.status(workspaceA, first.work_window_id)).state, 'DRAINING');
   await expectReject(() => guard.assertMutationAllowed(workspaceA, first.work_window_id), /DRAINING/);
+  const drainError = await expectReject(() => guard.assertContinuationAllowed(workspaceA), /substantive workspace work must stop/i);
+  assert.equal(drainError.details?.must_stop, true);
+  assert.equal(drainError.details?.checkpoint_required, true);
+  assert.equal(drainError.details?.auto_renew_allowed, false);
 
-  // D. Exact 30-minute boundary is EXPIRED; checkpoint remains allowed.
-  now = 1_800_000_000_000 + WORK_WINDOW_DURATION_MS;
-  assert.equal((await guard.status(workspaceA, first.work_window_id)).state, 'EXPIRED');
-  const expiredCheckpoint = await guard.checkpoint(workspaceA, first.work_window_id, {
+  // D. DRAINING checkpoint atomically records checkpoint + STOPPED without extending the deadline.
+  const drainedCheckpoint = await guard.checkpoint(workspaceA, first.work_window_id, {
     completed: ['implementation'],
     pending: ['validation'],
     resumeFrom: 'PRECOMMIT',
@@ -99,59 +104,82 @@ try {
     testCompleted: ['guard smoke'],
     testNotRun: []
   });
-  assert.equal(expiredCheckpoint.state, 'EXPIRED');
-  assert.equal(expiredCheckpoint.deadline, originalDeadline);
+  assert.equal(drainedCheckpoint.state, 'STOPPED');
+  assert.equal(drainedCheckpoint.deadline, originalDeadline);
+  assert(drainedCheckpoint.stopped_at);
+  await expectReject(() => guard.assertContinuationAllowed(workspaceA), /STOPPED/);
 
-  // E. A new continuation creates a new UUID/deadline and never mutates the old deadline.
+  // E. A new explicit start after STOPPED gets a new UUID/deadline; the old window is immutable.
   now += 10_000;
-  const continuation = await guard.start(workspaceA, { sessionBinding: 'transport-b' });
-  assert.notEqual(continuation.work_window_id, first.work_window_id);
+  const resumedStart = now;
+  const resumed = await guard.start(workspaceA, { sessionBinding: 'transport-b' });
+  assert.notEqual(resumed.work_window_id, first.work_window_id);
+  assert.equal(resumed.deadline, new Date(resumedStart + WORK_WINDOW_DURATION_MS).toISOString());
   assert.equal((await guard.status(workspaceA, first.work_window_id)).deadline, originalDeadline);
-  assert.equal(continuation.deadline, new Date(now + WORK_WINDOW_DURATION_MS).toISOString());
+  await guard.stop(workspaceA, resumed.work_window_id);
 
-  // F. Three same-workspace windows coexist instead of overwriting a singleton.
-  const sameWorkspace = await Promise.all([
+  // F. Concurrent same-workspace start allows exactly one winner.
+  now += 1_000;
+  const concurrent = await Promise.allSettled([
     guard.start(workspaceA),
     guard.start(workspaceA),
     guard.start(workspaceA)
   ]);
-  assert.equal(new Set(sameWorkspace.map((item) => item.work_window_id)).size, 3);
-  const activeA = await guard.listActive(workspaceA);
-  for (const item of sameWorkspace) assert(activeA.some((entry) => entry.work_window_id === item.work_window_id));
-  assert(activeA.every((entry) => entry.state === 'ACTIVE' || entry.state === 'DRAINING'));
+  const fulfilled = concurrent.filter((item) => item.status === 'fulfilled');
+  const rejected = concurrent.filter((item) => item.status === 'rejected');
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 2);
+  for (const item of rejected) assert.match(String(item.reason?.message ?? item.reason), /already ACTIVE|parallel continuation/i);
+  const concurrentWinner = fulfilled[0].value;
+  assert.equal((await guard.listActive(workspaceA)).filter((item) => item.state === 'ACTIVE').length, 1);
 
-  // G. Cross-workspace window is independent.
+  // G. Cross-workspace window remains independent.
   const cross = await guard.start(workspaceB);
   assert.equal((await guard.listActive(workspaceB)).some((item) => item.work_window_id === cross.work_window_id), true);
   assert.equal((await guard.listActive(workspaceA)).some((item) => item.work_window_id === cross.work_window_id), false);
 
-  // H. Concurrent checkpoints serialize through module-scope per-window locks.
-  const concurrentTarget = sameWorkspace[0];
-  await Promise.all([
-    guard.checkpoint(workspaceA, concurrentTarget.work_window_id, { completed: ['a'], pending: ['b'] }),
-    recovered.checkpoint(workspaceA, concurrentTarget.work_window_id, { completed: ['c'], pending: ['d'] })
-  ]);
-  const afterConcurrent = await guard.status(workspaceA, concurrentTarget.work_window_id);
-  assert(afterConcurrent.checkpoint);
-  assert(
-    JSON.stringify(afterConcurrent.checkpoint.completed) === JSON.stringify(['a']) ||
-      JSON.stringify(afterConcurrent.checkpoint.completed) === JSON.stringify(['c'])
-  );
+  // H. Exact deadline is terminal; EXPIRED checkpoint becomes STOPPED in the same durable update.
+  const winnerStart = Date.parse(concurrentWinner.started_at);
+  now = winnerStart + WORK_WINDOW_DURATION_MS;
+  assert.equal((await guard.status(workspaceA, concurrentWinner.work_window_id)).state, 'EXPIRED');
+  const expiredError = await expectReject(() => guard.assertContinuationAllowed(workspaceA), /EXPIRED/);
+  assert.equal(expiredError.details?.must_stop, true);
+  assert.equal(expiredError.details?.checkpoint_required, true);
+  const expiredCheckpoint = await guard.checkpoint(workspaceA, concurrentWinner.work_window_id, {
+    completed: ['active work'],
+    pending: ['next user turn'],
+    resumeFrom: 'STOPPED'
+  });
+  assert.equal(expiredCheckpoint.state, 'STOPPED');
+  assert.equal(expiredCheckpoint.deadline, concurrentWinner.deadline);
 
-  // I. Bash timeout clamps to the drain boundary.
-  const bashWindowStart = now;
+  // I. A fresh explicit start after terminal STOPPED restores ACTIVE and keeps bash clamped to drain.
+  now += 10_000;
+  const bashStart = now;
   const bashWindow = await guard.start(workspaceA);
-  now = bashWindowStart + WORK_WINDOW_ACTIVE_MS - 5_000;
+  now = bashStart + WORK_WINDOW_ACTIVE_MS - 5_000;
   const clamped = await guard.effectiveBashTimeout(workspaceA, bashWindow.work_window_id, 20_000, 60_000);
   assert.equal(clamped.timeoutMs, 5_000);
-  now = bashWindowStart + WORK_WINDOW_ACTIVE_MS - (WORK_WINDOW_MIN_BASH_BUDGET_MS - 1);
+  now = bashStart + WORK_WINDOW_ACTIVE_MS - (WORK_WINDOW_MIN_BASH_BUDGET_MS - 1);
   await expectReject(
     () => guard.effectiveBashTimeout(workspaceA, bashWindow.work_window_id, 20_000, 60_000),
     /less than 1000 ms ACTIVE budget/i
   );
 
-  // J. stop preserves immutable deadlines, excludes list, and blocks mutation.
-  now = bashWindowStart + 1_000;
+  // J. Concurrent checkpoints still serialize while ACTIVE.
+  now = bashStart + 1_000;
+  await Promise.all([
+    guard.checkpoint(workspaceA, bashWindow.work_window_id, { completed: ['a'], pending: ['b'] }),
+    recovered.checkpoint(workspaceA, bashWindow.work_window_id, { completed: ['c'], pending: ['d'] })
+  ]);
+  const afterConcurrentCheckpoint = await guard.status(workspaceA, bashWindow.work_window_id);
+  assert(afterConcurrentCheckpoint.checkpoint);
+  assert(
+    JSON.stringify(afterConcurrentCheckpoint.checkpoint.completed) === JSON.stringify(['a']) ||
+      JSON.stringify(afterConcurrentCheckpoint.checkpoint.completed) === JSON.stringify(['c'])
+  );
+
+  // K. Explicit stop preserves immutable deadlines, excludes list, and blocks continuation.
   const beforeStop = await guard.status(workspaceA, bashWindow.work_window_id);
   const stopped = await guard.stop(workspaceA, bashWindow.work_window_id);
   assert.equal(stopped.state, 'STOPPED');
@@ -161,8 +189,9 @@ try {
   assert.equal((await guard.listActive(workspaceA)).some((item) => item.work_window_id === stopped.work_window_id), false);
   await expectReject(() => guard.assertMutationAllowed(workspaceA, stopped.work_window_id), /STOPPED/);
   await expectReject(() => guard.checkpoint(workspaceA, stopped.work_window_id, {}), /stopped/i);
+  await expectReject(() => guard.assertContinuationAllowed(workspaceA), /STOPPED/);
 
-  // K. Corrupt durable state fails closed and is not silently replaced.
+  // L. Corrupt durable state fails closed and is not silently replaced.
   const corruptHome = path.join(tmp, 'corrupt-registry');
   const corruptWindows = path.join(corruptHome, 'windows');
   await fs.mkdir(corruptWindows, { recursive: true });
@@ -175,9 +204,9 @@ try {
   await fs.writeFile(path.join(corruptWindows, `${corruptId}.json`), '{broken json\n', 'utf8');
   const corruptGuard = new WorkWindowGuard({ homeDir: corruptHome, now: () => now, uuid: sequenceUuid(UUIDS.slice(12)) });
   await expectReject(() => corruptGuard.status(workspaceA, corruptId), /Corrupt Work Window registry JSON/);
-  await expectReject(() => corruptGuard.assertMutationAllowed(workspaceA, corruptId), /Corrupt Work Window registry JSON/);
+  await expectReject(() => corruptGuard.assertContinuationAllowed(workspaceA), /Corrupt Work Window registry JSON/);
 
-  // L. Corrupt host identity fails closed; no silent host remint.
+  // M. Corrupt host identity fails closed; no silent host remint.
   const corruptHostHome = path.join(tmp, 'corrupt-host');
   await fs.mkdir(corruptHostHome, { recursive: true });
   await fs.writeFile(path.join(corruptHostHome, 'host.json'), '{"version":1,"host_id":"bad"}\n', 'utf8');
@@ -186,7 +215,7 @@ try {
   const hostAfter = await fs.readFile(path.join(corruptHostHome, 'host.json'), 'utf8');
   assert.match(hostAfter, /"bad"/);
 
-  console.log('work-window-guard-smoke: PASS (A-L)');
+  console.log('work-window-guard-smoke: PASS (A-M)');
 } finally {
-  await fs.rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await fs.rm(tmp, { recursive: true, force: true });
 }

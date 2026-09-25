@@ -114,7 +114,9 @@ const workWindowHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-h
 const priorCodexProHome = process.env.CODEXPRO_HOME;
 process.env.CODEXPRO_HOME = workWindowHome;
 const alternateWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-alternate-'));
+const longPollWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-long-poll-'));
 await fs.writeFile(path.join(alternateWorkspace, 'selected.txt'), 'alternate workspace\n', 'utf8');
+await fs.writeFile(path.join(longPollWorkspace, 'selected.txt'), 'long poll workspace\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'demo.txt'), 'alpha\nread\nread\nomega\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'other.txt'), 'keep\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'patch-race.txt'), 'patch race initial\n', 'utf8');
@@ -253,12 +255,12 @@ if (commitResult.status !== 0) {
   throw new Error(`git commit failed: ${commitResult.stderr || commitResult.stdout}`);
 }
 
-const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full'], {
+const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--allow-root', longPollWorkspace, '--bash', 'safe', '--tool-mode', 'full'], {
   cwd: path.resolve('.'),
   env: {
     ...process.env,
     CODEXPRO_ROOT: tmp,
-    CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
+    CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace, longPollWorkspace].join(path.delimiter),
     CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
     CODEXPRO_TOOL_CARDS: '0'
   }
@@ -553,6 +555,26 @@ const wrongSuperWindow = await client.request('tools/call', {
 if (!wrongSuperWindow.isError || !/not found/i.test(JSON.stringify(wrongSuperWindow))) {
   throw new Error(`supertool wrong work_window_id did not fail closed: ${JSON.stringify(wrongSuperWindow)}`);
 }
+const longPollOpened = await client.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: longPollWorkspace, include_tree: false }
+});
+const longPollWs = longPollOpened.structuredContent.workspace_id;
+await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+
+const assertTerminalTool = async (name, args, expectedState) => {
+  const result = await client.request('tools/call', { name, arguments: args });
+  if (
+    !result.isError ||
+    result.structuredContent?.must_stop !== true ||
+    result.structuredContent?.work_window_state !== expectedState ||
+    result.structuredContent?.auto_renew_allowed !== false
+  ) {
+    throw new Error(`${name} did not fail closed for ${expectedState}: ${JSON.stringify(result)}`);
+  }
+  return result;
+};
+
 const expiredWindowId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const expiredStartedMs = Date.now() - 31 * 60 * 1000;
 const expiredDrainMs = expiredStartedMs + 27 * 60 * 1000;
@@ -562,8 +584,8 @@ await fs.writeFile(expiredWindowPath, `${JSON.stringify({
   version: 1,
   host_id: activeWorkWindow.structuredContent.host_id,
   work_window_id: expiredWindowId,
-  workspace_id: ws,
-  workspace_root: opened.structuredContent.root,
+  workspace_id: alternate.structuredContent.workspace_id,
+  workspace_root: alternate.structuredContent.root,
   started_at: new Date(expiredStartedMs).toISOString(),
   started_at_ms: expiredStartedMs,
   drain_at: new Date(expiredDrainMs).toISOString(),
@@ -571,19 +593,200 @@ await fs.writeFile(expiredWindowPath, `${JSON.stringify({
   deadline: new Date(expiredDeadlineMs).toISOString(),
   deadline_ms: expiredDeadlineMs
 }, null, 2)}\n`, 'utf8');
-await expectToolError('edit', {
-  workspace_id: ws,
-  work_window_id: expiredWindowId,
-  path: 'demo.txt',
-  old_text: 'alpha',
-  new_text: 'blocked'
-}, /EXPIRED/);
-const expiredSuperWindow = await client.request('tools/call', {
+
+for (const [name, args] of [
+  ['read', { workspace_id: alternate.structuredContent.workspace_id, path: 'selected.txt' }],
+  ['search', { workspace_id: alternate.structuredContent.workspace_id, query: 'alternate' }],
+  ['tree', { workspace_id: alternate.structuredContent.workspace_id, max_depth: 1 }],
+  ['workspace_snapshot', { workspace_id: alternate.structuredContent.workspace_id, max_depth: 1 }],
+  ['inspect_workspace', { workspace_id: alternate.structuredContent.workspace_id }],
+  ['git_status', { workspace_id: alternate.structuredContent.workspace_id }],
+  ['git_diff', { workspace_id: alternate.structuredContent.workspace_id, include_diff: false }],
+  ['show_changes', { workspace_id: alternate.structuredContent.workspace_id, include_diff: false }],
+  ['read_handoff', { workspace_id: alternate.structuredContent.workspace_id }],
+  ['codex_context', { workspace_id: alternate.structuredContent.workspace_id }]
+]) {
+  await assertTerminalTool(name, args, 'EXPIRED');
+}
+
+const expiredSuperRead = await client.request('tools/call', {
   name: 'codexpro',
-  arguments: { action: 'bash', args: { workspace_id: ws, work_window_id: expiredWindowId, command: 'pwd' } }
+  arguments: {
+    action: 'read',
+    args: { workspace_id: alternate.structuredContent.workspace_id, path: 'selected.txt' }
+  }
 });
-if (!expiredSuperWindow.isError || !/EXPIRED/.test(JSON.stringify(expiredSuperWindow))) {
-  throw new Error(`supertool expired work_window_id did not fail closed: ${JSON.stringify(expiredSuperWindow)}`);
+if (
+  !expiredSuperRead.isError ||
+  expiredSuperRead.structuredContent?.must_stop !== true ||
+  expiredSuperRead.structuredContent?.work_window_state !== 'EXPIRED'
+) {
+  throw new Error(`supertool expired read bypassed continuation latch: ${JSON.stringify(expiredSuperRead)}`);
+}
+
+const expiredOpen = await client.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: alternateWorkspace, include_tree: true }
+});
+if (
+  !expiredOpen.isError ||
+  expiredOpen.structuredContent?.must_stop !== true ||
+  expiredOpen.structuredContent?.work_window_state !== 'EXPIRED' ||
+  expiredOpen.structuredContent?.tree
+) {
+  throw new Error(`open_workspace exposed terminal workspace data: ${JSON.stringify(expiredOpen)}`);
+}
+const orientationConfig = await client.request('tools/call', { name: 'server_config', arguments: {} });
+const orientationList = await client.request('tools/call', { name: 'list_workspaces', arguments: {} });
+if (orientationConfig.isError || orientationList.isError) {
+  throw new Error('orientation/control tools were blocked by terminal workspace latch');
+}
+await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
+
+const expiredStatus = await client.request('tools/call', {
+  name: 'work_window_status',
+  arguments: { workspace_id: alternate.structuredContent.workspace_id, work_window_id: expiredWindowId }
+});
+if (
+  expiredStatus.isError ||
+  expiredStatus.structuredContent?.work_window_state !== 'EXPIRED' ||
+  expiredStatus.structuredContent?.must_stop !== true ||
+  expiredStatus.structuredContent?.checkpoint_required !== true
+) {
+  throw new Error(`terminal work_window_status metadata mismatch: ${JSON.stringify(expiredStatus)}`);
+}
+const expiredCheckpoint = await client.request('tools/call', {
+  name: 'checkpoint_work_window',
+  arguments: {
+    workspace_id: alternate.structuredContent.workspace_id,
+    work_window_id: expiredWindowId,
+    completed: ['expired latch verified'],
+    pending: ['fresh explicit start'],
+    resume_from: 'STOPPED'
+  }
+});
+if (
+  expiredCheckpoint.isError ||
+  expiredCheckpoint.structuredContent?.state !== 'STOPPED' ||
+  expiredCheckpoint.structuredContent?.must_stop !== true ||
+  expiredCheckpoint.structuredContent?.deadline !== new Date(expiredDeadlineMs).toISOString()
+) {
+  throw new Error(`EXPIRED checkpoint did not atomically STOP: ${JSON.stringify(expiredCheckpoint)}`);
+}
+await assertTerminalTool(
+  'read',
+  { workspace_id: alternate.structuredContent.workspace_id, path: 'selected.txt' },
+  'STOPPED'
+);
+
+const concurrentStarts = await Promise.all([
+  client.request('tools/call', {
+    name: 'start_work_window',
+    arguments: { workspace_id: alternate.structuredContent.workspace_id, session_binding: 'concurrent-a' }
+  }),
+  client.request('tools/call', {
+    name: 'start_work_window',
+    arguments: { workspace_id: alternate.structuredContent.workspace_id, session_binding: 'concurrent-b' }
+  }),
+  client.request('tools/call', {
+    name: 'start_work_window',
+    arguments: { workspace_id: alternate.structuredContent.workspace_id, session_binding: 'concurrent-c' }
+  })
+]);
+const concurrentWinners = concurrentStarts.filter((result) => !result.isError && result.structuredContent?.state === 'ACTIVE');
+const concurrentLosers = concurrentStarts.filter((result) => result.isError);
+if (concurrentWinners.length !== 1 || concurrentLosers.length !== 2) {
+  throw new Error(`same-workspace concurrent start was not exact1: ${JSON.stringify(concurrentStarts)}`);
+}
+const alternateActive = concurrentWinners[0];
+if (alternateActive.structuredContent.work_window_id === expiredWindowId) {
+  throw new Error('fresh start reused expired Work Window id');
+}
+const resumedAlternateRead = await client.request('tools/call', {
+  name: 'read',
+  arguments: { workspace_id: alternate.structuredContent.workspace_id, path: 'selected.txt' }
+});
+if (resumedAlternateRead.isError) {
+  throw new Error(`fresh explicit start did not restore alternate workspace work: ${JSON.stringify(resumedAlternateRead)}`);
+}
+await client.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: alternate.structuredContent.workspace_id,
+    work_window_id: alternateActive.structuredContent.work_window_id
+  }
+});
+const crossWorkspaceMainRead = await client.request('tools/call', {
+  name: 'read',
+  arguments: { workspace_id: ws, path: 'demo.txt' }
+});
+if (crossWorkspaceMainRead.isError) {
+  throw new Error(`terminal alternate workspace incorrectly latched main workspace: ${JSON.stringify(crossWorkspaceMainRead)}`);
+}
+
+const nearDrainWindowId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const nearDrainStartedMs = Date.now() - 27 * 60 * 1000 + 1500;
+const nearDrainDrainMs = nearDrainStartedMs + 27 * 60 * 1000;
+const nearDrainDeadlineMs = nearDrainStartedMs + 30 * 60 * 1000;
+await fs.writeFile(
+  path.join(workWindowHome, 'work-windows', 'windows', `${nearDrainWindowId}.json`),
+  `${JSON.stringify({
+    version: 1,
+    host_id: activeWorkWindow.structuredContent.host_id,
+    work_window_id: nearDrainWindowId,
+    workspace_id: longPollWs,
+    workspace_root: longPollOpened.structuredContent.root,
+    started_at: new Date(nearDrainStartedMs).toISOString(),
+    started_at_ms: nearDrainStartedMs,
+    drain_at: new Date(nearDrainDrainMs).toISOString(),
+    drain_at_ms: nearDrainDrainMs,
+    deadline: new Date(nearDrainDeadlineMs).toISOString(),
+    deadline_ms: nearDrainDeadlineMs
+  }, null, 2)}\n`,
+  'utf8'
+);
+const longPollStarted = Date.now();
+const nearDrainPoll = await client.request('tools/call', {
+  name: 'wait_for_handoff',
+  arguments: { workspace_id: longPollWs, max_wait_seconds: 5, poll_ms: 250 }
+});
+const longPollElapsed = Date.now() - longPollStarted;
+if (
+  nearDrainPoll.isError ||
+  longPollElapsed >= 4000 ||
+  nearDrainPoll.structuredContent?.must_stop !== true ||
+  nearDrainPoll.structuredContent?.work_window_state !== 'DRAINING'
+) {
+  throw new Error(`wait_for_handoff did not clamp/postflight at drain boundary: elapsed=${longPollElapsed} result=${JSON.stringify(nearDrainPoll)}`);
+}
+await assertTerminalTool('read', { workspace_id: longPollWs, path: 'selected.txt' }, 'DRAINING');
+const nearDrainSuperRead = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'read', args: { workspace_id: longPollWs, path: 'selected.txt' } }
+});
+if (
+  !nearDrainSuperRead.isError ||
+  nearDrainSuperRead.structuredContent?.must_stop !== true ||
+  nearDrainSuperRead.structuredContent?.work_window_state !== 'DRAINING'
+) {
+  throw new Error(`supertool DRAINING read bypassed latch: ${JSON.stringify(nearDrainSuperRead)}`);
+}
+const nearDrainCheckpoint = await client.request('tools/call', {
+  name: 'checkpoint_work_window',
+  arguments: {
+    workspace_id: longPollWs,
+    work_window_id: nearDrainWindowId,
+    completed: ['long-poll clamp verified'],
+    pending: ['new user turn'],
+    resume_from: 'STOPPED'
+  }
+});
+if (
+  nearDrainCheckpoint.isError ||
+  nearDrainCheckpoint.structuredContent?.state !== 'STOPPED' ||
+  nearDrainCheckpoint.structuredContent?.must_stop !== true
+) {
+  throw new Error(`DRAINING checkpoint did not atomically STOP: ${JSON.stringify(nearDrainCheckpoint)}`);
 }
 const workspaceAnalysis = await client.request('tools/call', { name: 'inspect_workspace', arguments: { workspace_id: ws } });
 if (!workspaceAnalysis.structuredContent.languages?.includes('typescript') || !workspaceAnalysis.structuredContent.coverage) {
@@ -1259,7 +1462,7 @@ if (process.platform !== 'win32') {
     name: 'open_current_workspace',
     arguments: { include_tree: false }
   });
-  await startClientWorkWindow(processTreeClient, processTreeOpened.structuredContent.workspace_id);
+  processTreeClient.workWindowId = activeWorkWindow.structuredContent.work_window_id;
   const descendantPidPath = path.join(tmp, 'bash-descendant.pid');
   const descendantScript = [
     "const { spawn } = require('node:child_process');",
@@ -1466,7 +1669,7 @@ await fullTranscriptClient.request('initialize', {
   clientInfo: { name: 'codexpro-full-bash-transcript-smoke', version: '0.1.0' }
 });
 fullTranscriptClient.notify('notifications/initialized');
-await startClientWorkWindow(fullTranscriptClient);
+fullTranscriptClient.workWindowId = activeWorkWindow.structuredContent.work_window_id;
 const fullTranscriptBash = await fullTranscriptClient.request('tools/call', { name: 'bash', arguments: { command: 'pwd' } });
 const fullTranscriptText = fullTranscriptBash.content?.[0]?.text ?? '';
 const fullTranscriptStdout = (fullTranscriptBash.structuredContent.stdout ?? '').trim();
@@ -1756,7 +1959,7 @@ await sessionGuardClient.request('initialize', {
   clientInfo: { name: 'codexpro-bash-session-smoke', version: '0.1.0' }
 });
 sessionGuardClient.notify('notifications/initialized');
-await startClientWorkWindow(sessionGuardClient);
+sessionGuardClient.workWindowId = activeWorkWindow.structuredContent.work_window_id;
 const guardedConfig = await sessionGuardClient.request('tools/call', { name: 'server_config', arguments: {} });
 if (guardedConfig.structuredContent.bashSessionId !== 'codex-main' || guardedConfig.structuredContent.requireBashSession !== true) {
   throw new Error(`server_config did not expose bash session guard: ${JSON.stringify(guardedConfig.structuredContent)}`);
