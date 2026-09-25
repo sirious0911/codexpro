@@ -13,6 +13,29 @@ export interface Workspace {
   openedAt: string;
 }
 
+export class WorkspaceRegistry {
+  private readonly workspaces = new Map<string, Workspace>();
+
+  findByRoot(root: string): Workspace | undefined {
+    return [...this.workspaces.values()].find((workspace) => workspace.root === root);
+  }
+
+  get(id: string): Workspace | undefined {
+    return this.workspaces.get(id);
+  }
+
+  register(workspace: Workspace): Workspace {
+    const existing = this.workspaces.get(workspace.id);
+    if (existing) return existing;
+    this.workspaces.set(workspace.id, workspace);
+    return workspace;
+  }
+
+  delete(id: string): void {
+    this.workspaces.delete(id);
+  }
+}
+
 export class CodexProError extends Error {
   constructor(message: string) {
     super(message);
@@ -62,7 +85,10 @@ export class WorkspaceManager {
   private readonly workspaces = new Map<string, Workspace>();
   private selectedWorkspaceId?: string;
 
-  constructor(private readonly config: CodexProConfig, private readonly sharedWorkspaceRoots?: Map<string, string>) {}
+  constructor(
+    private readonly config: CodexProConfig,
+    private readonly registry = new WorkspaceRegistry()
+  ) {}
 
   defaultWorkspace(): Workspace {
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot);
@@ -93,17 +119,16 @@ export class WorkspaceManager {
       );
     }
 
-    const existing = [...this.workspaces.values()].find((workspace) => workspace.root === realRoot);
+    const existing = this.registry.findByRoot(realRoot);
     if (existing) {
-      this.sharedWorkspaceRoots?.set(existing.id, existing.root);
+      this.workspaces.set(existing.id, existing);
       if (options.select !== false) this.selectedWorkspaceId = existing.id;
       return existing;
     }
 
     const id = workspaceIdForRoot(realRoot);
-    const workspace = { id, root: realRoot, openedAt: new Date().toISOString() };
+    const workspace = this.registry.register({ id, root: realRoot, openedAt: new Date().toISOString() });
     this.workspaces.set(id, workspace);
-    this.sharedWorkspaceRoots?.set(id, realRoot);
     if (options.select !== false) this.selectedWorkspaceId = id;
     return workspace;
   }
@@ -116,22 +141,25 @@ export class WorkspaceManager {
       }
       return this.selectDefaultWorkspace();
     }
-    const workspace = this.workspaces.get(id);
+    let workspace = this.workspaces.get(id) ?? this.registry.get(id);
+    if (workspace) {
+      try {
+        const stat = fs.statSync(workspace.root);
+        const realRoot = fs.realpathSync.native(workspace.root);
+        const allowed = stat.isDirectory() && this.config.allowedRoots.some((allowedRoot) => isSubpath(realRoot, allowedRoot));
+        if (!allowed || workspaceIdForRoot(realRoot) !== id) {
+          throw new Error("stale workspace root");
+        }
+        this.workspaces.set(id, workspace);
+      } catch {
+        this.workspaces.delete(id);
+        this.registry.delete(id);
+        workspace = undefined;
+      }
+    }
     if (!workspace) {
       const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
       if (configuredRoot) return this.openWorkspace(configuredRoot, { select: false });
-    }
-    if (!workspace) {
-      const sharedRoot = this.sharedWorkspaceRoots?.get(id);
-      if (sharedRoot) {
-        try {
-          const restored = this.openWorkspace(sharedRoot, { select: false });
-          if (restored.id === id) return restored;
-        } catch {
-          // Treat stale or no-longer-allowed shared roots as unknown.
-        }
-        this.sharedWorkspaceRoots?.delete(id);
-      }
     }
     if (!workspace) {
       throw new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);

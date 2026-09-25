@@ -4,9 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
+
 const REQUEST_TIMEOUT_MS = process.platform === 'win32' ? 45_000 : 20_000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workWindowHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-home-'));
+let workWindowClientSeq = 0;
 const WORK_WINDOW_GUARDED_TOOLS = new Set(['write', 'edit', 'apply_patch', 'import_file', 'bash']);
 
 function assert(ok, message) {
@@ -33,7 +36,7 @@ class McpStdioClient {
         CODEXPRO_ALLOWED_ROOTS: root,
         CODEXPRO_TOOL_MODE: env.CODEXPRO_TOOL_MODE ?? 'full',
         CODEXPRO_BASH_MODE: env.CODEXPRO_BASH_MODE ?? 'safe',
-        CODEXPRO_HOME: env.CODEXPRO_HOME ?? workWindowHome,
+        CODEXPRO_HOME: env.CODEXPRO_HOME ?? path.join(workWindowHome, `client-${++workWindowClientSeq}`),
         CODEXPRO_MAX_SEARCH_RESULTS: '2000',
         CODEXPRO_MAX_OUTPUT_BYTES: env.CODEXPRO_MAX_OUTPUT_BYTES ?? '2000000',
         CODEXPRO_TOOL_CARDS: env.CODEXPRO_TOOL_CARDS ?? '0'

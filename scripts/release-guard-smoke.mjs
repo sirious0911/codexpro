@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveNpmInvocation } from "./npm-cli.mjs";
 
+process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = "1";
+
 const root = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 
 
