@@ -389,36 +389,115 @@ export class WorkWindowGuard {
   }
 
   private async recoverAndScheduleDeadlines(): Promise<void> {
-    const host = await this.readExistingHost();
-    if (!host) return;
-    let names: string[];
-    try {
-      names = await fsp.readdir(this.windowsDir);
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return;
-      throw error;
-    }
-    const recordNames = names.filter((name) => name.endsWith(".json")).sort();
-    if (recordNames.length > MAX_WINDOW_RECORDS) {
-      throw new WorkWindowError(`Work Window registry exceeds bounded limit of ${MAX_WINDOW_RECORDS} records.`);
-    }
-    for (const name of recordNames) {
-      const id = name.slice(0, -5);
-      assertUuid(id, "work_window_id");
-      const pathname = path.join(this.windowsDir, name);
-      const raw = await readJson(pathname);
-      if (raw === undefined) continue;
-      const record = validateWindowRecord(raw, pathname);
-      if (record.host_id !== host.host_id) {
-        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+    await withWindowLock(this.registryLockKey(), async () => {
+      const host = await this.readExistingHost();
+      if (!host) return;
+      const recordNames = await this.registryRecordNames();
+      const entries: Array<{ name: string; pathname: string; record: WorkWindowRecord }> = [];
+
+      for (const name of recordNames) {
+        const id = assertUuid(name.slice(0, -5), "work_window_id");
+        const pathname = path.join(this.windowsDir, name);
+        const raw = await readJson(pathname);
+        if (raw === undefined) continue;
+        const record = validateWindowRecord(raw, pathname);
+        if (record.work_window_id !== id) {
+          throw new WorkWindowError(`Work Window filename/id mismatch: ${name}`);
+        }
+        if (record.host_id !== host.host_id) {
+          throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+        }
+        if (record.stopped_at_ms === undefined && this.now() >= record.deadline_ms) {
+          record.stopped_at_ms = record.deadline_ms;
+          record.stopped_at = record.deadline;
+          record.stop_reason = "DEADLINE_AUTO";
+          await atomicWriteJson(pathname, record);
+        }
+        entries.push({ name, pathname, record });
       }
-      if (record.stopped_at_ms !== undefined) continue;
-      if (this.now() >= record.deadline_ms) {
-        await this.terminalizeDeadline(record.work_window_id);
-      } else {
-        this.scheduleDeadlineTimer(record);
+
+      if (entries.length > MAX_WINDOW_RECORDS) {
+        const latest = [...entries].sort(
+          (a, b) =>
+            a.record.started_at_ms - b.record.started_at_ms ||
+            a.record.work_window_id.localeCompare(b.record.work_window_id)
+        ).at(-1);
+        if (!latest) throw new WorkWindowError("Work Window registry latest record could not be determined.");
+
+        const archiveCount = entries.length - MAX_WINDOW_RECORDS;
+        const archiveCandidates = entries
+          .filter(
+            (entry) =>
+              entry.record.stopped_at_ms !== undefined &&
+              entry.record.work_window_id !== latest.record.work_window_id
+          )
+          .sort(
+            (a, b) =>
+              a.record.started_at_ms - b.record.started_at_ms ||
+              a.record.work_window_id.localeCompare(b.record.work_window_id)
+          );
+        if (archiveCandidates.length < archiveCount) {
+          throw new WorkWindowError(
+            `Work Window registry has ${entries.length} records but only ${archiveCandidates.length} archivable STOPPED records; non-terminal records will not be archived.`
+          );
+        }
+
+        const archiveDir = path.join(this.rootDir, "archive");
+        await fsp.mkdir(archiveDir, { recursive: true });
+        const selected = archiveCandidates.slice(0, archiveCount);
+        const destinations = selected.map((entry) => ({ entry, destination: path.join(archiveDir, entry.name) }));
+        for (const { destination } of destinations) {
+          try {
+            await fsp.access(destination);
+            throw new WorkWindowError(`Work Window archive destination already exists: ${destination}`);
+          } catch (error) {
+            if (errorCode(error) !== "ENOENT") throw error;
+          }
+        }
+
+        const moved: Array<{ entry: (typeof selected)[number]; destination: string }> = [];
+        try {
+          for (const item of destinations) {
+            await fsp.rename(item.entry.pathname, item.destination);
+            moved.push(item);
+          }
+        } catch (error) {
+          let rollbackError: unknown;
+          for (const item of [...moved].reverse()) {
+            try {
+              await fsp.rename(item.destination, item.entry.pathname);
+            } catch (caught) {
+              rollbackError ??= caught;
+            }
+          }
+          if (rollbackError) {
+            throw new WorkWindowError(`Work Window archive failed and rollback also failed: ${String(rollbackError)}`);
+          }
+          throw error;
+        }
+
+        await syncDirectoryBestEffort(this.windowsDir);
+        await syncDirectoryBestEffort(archiveDir);
+        const recoveredCount = (await this.registryRecordNames()).length;
+        if (recoveredCount > MAX_WINDOW_RECORDS) {
+          throw new WorkWindowError(
+            `Work Window registry recovery left ${recoveredCount} records, above bounded limit ${MAX_WINDOW_RECORDS}.`
+          );
+        }
       }
-    }
+
+      const remainingNames = await this.registryRecordNames();
+      for (const name of remainingNames) {
+        const pathname = path.join(this.windowsDir, name);
+        const raw = await readJson(pathname);
+        if (raw === undefined) continue;
+        const record = validateWindowRecord(raw, pathname);
+        if (record.host_id !== host.host_id) {
+          throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+        }
+        if (record.stopped_at_ms === undefined) this.scheduleDeadlineTimer(record);
+      }
+    });
   }
 
   registryRoot(): string {
@@ -427,6 +506,96 @@ export class WorkWindowGuard {
 
   private windowPath(workWindowId: string): string {
     return path.join(this.windowsDir, `${assertUuid(workWindowId, "work_window_id")}.json`);
+  }
+
+  private registryLockKey(): string {
+    return path.join(this.rootDir, ".registry-capacity");
+  }
+
+  private async registryRecordNames(): Promise<string[]> {
+    let names: string[];
+    try {
+      names = await fsp.readdir(this.windowsDir);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return [];
+      throw error;
+    }
+    return names.filter((name) => name.endsWith(".json")).sort();
+  }
+
+  private async reclaimStoppedRecordForStart(host: HostRecord): Promise<boolean> {
+    const recordNames = await this.registryRecordNames();
+    if (recordNames.length < MAX_WINDOW_RECORDS) return false;
+    if (recordNames.length > MAX_WINDOW_RECORDS) {
+      throw new WorkWindowError(
+        `Work Window registry still exceeds bounded limit of ${MAX_WINDOW_RECORDS} records after bootstrap recovery.`
+      );
+    }
+
+    const entries: Array<{ name: string; pathname: string; record: WorkWindowRecord }> = [];
+    for (const name of recordNames) {
+      const id = assertUuid(name.slice(0, -5), "work_window_id");
+      const pathname = path.join(this.windowsDir, name);
+      const raw = await readJson(pathname);
+      if (raw === undefined) {
+        throw new WorkWindowError(`Work Window record disappeared during capacity reclaim: ${name}`);
+      }
+      const record = validateWindowRecord(raw, pathname);
+      if (record.work_window_id !== id) {
+        throw new WorkWindowError(`Work Window filename/id mismatch: ${name}`);
+      }
+      if (record.host_id !== host.host_id) {
+        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+      }
+      entries.push({ name, pathname, record });
+    }
+
+    const latest = [...entries].sort(
+      (a, b) =>
+        a.record.started_at_ms - b.record.started_at_ms ||
+        a.record.work_window_id.localeCompare(b.record.work_window_id)
+    ).at(-1);
+    if (!latest) throw new WorkWindowError("Work Window registry latest record could not be determined.");
+
+    const candidate = entries
+      .filter(
+        (entry) =>
+          entry.record.stopped_at_ms !== undefined &&
+          entry.record.work_window_id !== latest.record.work_window_id
+      )
+      .sort(
+        (a, b) =>
+          a.record.started_at_ms - b.record.started_at_ms ||
+          a.record.work_window_id.localeCompare(b.record.work_window_id)
+      )
+      .at(0);
+    if (!candidate) {
+      throw new WorkWindowError(
+        `Work Window registry is at bounded capacity ${recordNames.length}/${MAX_WINDOW_RECORDS} and has no reclaimable STOPPED record; start did not create a new record.`,
+        { registry_count: recordNames.length, registry_limit: MAX_WINDOW_RECORDS, record_created: false }
+      );
+    }
+
+    const archiveDir = path.join(this.rootDir, "archive");
+    await fsp.mkdir(archiveDir, { recursive: true });
+    const destination = path.join(archiveDir, candidate.name);
+    try {
+      await fsp.access(destination);
+      throw new WorkWindowError(`Work Window archive destination already exists: ${destination}`);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+    }
+
+    await fsp.rename(candidate.pathname, destination);
+    await syncDirectoryBestEffort(this.windowsDir);
+    await syncDirectoryBestEffort(archiveDir);
+    const remainingCount = (await this.registryRecordNames()).length;
+    if (remainingCount !== MAX_WINDOW_RECORDS - 1) {
+      throw new WorkWindowError(
+        `Work Window capacity reclaim left unexpected registry count ${remainingCount}; expected ${MAX_WINDOW_RECORDS - 1}.`
+      );
+    }
+    return true;
   }
 
   private workspaceLockKey(workspace: Workspace): string {
@@ -573,52 +742,73 @@ export class WorkWindowGuard {
   }
 
   async start(workspace: Workspace, options: { sessionBinding?: string } = {}): Promise<WorkWindowStatus> {
-    return withWindowLock(this.workspaceLockKey(workspace), async () => {
-      const nowMs = this.now();
-      const existing = (await this.workspaceRecords(workspace))
-        .map((record) => this.statusFrom(record, nowMs))
-        .filter((status) => status.state === "ACTIVE" || status.state === "DRAINING")
-        .at(-1);
-      if (existing) {
-        throw new WorkWindowError(
-          `Work Window ${existing.work_window_id} is already ${existing.state} for this workspace; parallel continuation and auto-renewal are not allowed.`,
-          {
-            work_window_id: existing.work_window_id,
-            work_window_state: existing.state,
-            must_stop: existing.state === "DRAINING",
-            checkpoint_required: existing.state === "DRAINING",
-            auto_renew_allowed: false
-          }
-        );
-      }
+    await this.initialize();
+    return withWindowLock(this.registryLockKey(), async () =>
+      withWindowLock(this.workspaceLockKey(workspace), async () => {
+        const nowMs = this.now();
+        const existing = (await this.workspaceRecords(workspace))
+          .map((record) => this.statusFrom(record, nowMs))
+          .filter((status) => status.state === "ACTIVE" || status.state === "DRAINING")
+          .at(-1);
+        if (existing) {
+          throw new WorkWindowError(
+            `Work Window ${existing.work_window_id} is already ${existing.state} for this workspace; parallel continuation and auto-renewal are not allowed.`,
+            {
+              work_window_id: existing.work_window_id,
+              work_window_state: existing.state,
+              must_stop: existing.state === "DRAINING",
+              checkpoint_required: existing.state === "DRAINING",
+              auto_renew_allowed: false
+            }
+          );
+        }
 
-      const host = await this.ensureHost();
-      const workWindowId = assertUuid(this.uuid(), "work_window_id");
-      const sessionBinding = options.sessionBinding === undefined
-        ? undefined
-        : boundedText(options.sessionBinding, MAX_SESSION_BINDING_LENGTH, "session_binding");
-      const record: WorkWindowRecord = {
-        version: 1,
-        host_id: host.host_id,
-        work_window_id: workWindowId,
-        workspace_id: workspace.id,
-        workspace_root: workspace.root,
-        started_at: iso(nowMs),
-        started_at_ms: nowMs,
-        drain_at: iso(nowMs + WORK_WINDOW_ACTIVE_MS),
-        drain_at_ms: nowMs + WORK_WINDOW_ACTIVE_MS,
-        deadline: iso(nowMs + WORK_WINDOW_DURATION_MS),
-        deadline_ms: nowMs + WORK_WINDOW_DURATION_MS,
-        ...(sessionBinding ? { session_binding: sessionBinding } : {})
-      };
-      const pathname = this.windowPath(workWindowId);
-      if (await readJson(pathname) !== undefined) {
-        throw new WorkWindowError(`Work Window id collision: ${workWindowId}`);
-      }
-      await atomicWriteJson(pathname, record);
-      this.scheduleDeadlineTimer(record);
-      return this.statusFrom(record, nowMs);
-    });
+        let recordCount = (await this.registryRecordNames()).length;
+        let host = await this.readExistingHost();
+        if (recordCount >= MAX_WINDOW_RECORDS) {
+          if (!host) {
+            throw new WorkWindowError(
+              "Work Window registry has records but host identity is not initialized; capacity reclaim is fail-closed."
+            );
+          }
+          await this.reclaimStoppedRecordForStart(host);
+          recordCount = (await this.registryRecordNames()).length;
+        }
+        if (recordCount >= MAX_WINDOW_RECORDS) {
+          throw new WorkWindowError(
+            `Work Window registry is at bounded capacity ${recordCount}/${MAX_WINDOW_RECORDS}; start did not create a new record.`,
+            { registry_count: recordCount, registry_limit: MAX_WINDOW_RECORDS, record_created: false }
+          );
+        }
+
+        host ??= await this.ensureHost();
+        const workWindowId = assertUuid(this.uuid(), "work_window_id");
+        const sessionBinding = options.sessionBinding === undefined
+          ? undefined
+          : boundedText(options.sessionBinding, MAX_SESSION_BINDING_LENGTH, "session_binding");
+        const record: WorkWindowRecord = {
+          version: 1,
+          host_id: host.host_id,
+          work_window_id: workWindowId,
+          workspace_id: workspace.id,
+          workspace_root: workspace.root,
+          started_at: iso(nowMs),
+          started_at_ms: nowMs,
+          drain_at: iso(nowMs + WORK_WINDOW_ACTIVE_MS),
+          drain_at_ms: nowMs + WORK_WINDOW_ACTIVE_MS,
+          deadline: iso(nowMs + WORK_WINDOW_DURATION_MS),
+          deadline_ms: nowMs + WORK_WINDOW_DURATION_MS,
+          ...(sessionBinding ? { session_binding: sessionBinding } : {})
+        };
+        const pathname = this.windowPath(workWindowId);
+        if (await readJson(pathname) !== undefined) {
+          throw new WorkWindowError(`Work Window id collision: ${workWindowId}`);
+        }
+        await atomicWriteJson(pathname, record);
+        this.scheduleDeadlineTimer(record);
+        return this.statusFrom(record, nowMs);
+      })
+    );
   }
 
   async status(workspace: Workspace, workWindowId: string): Promise<WorkWindowStatus> {

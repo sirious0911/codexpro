@@ -48,6 +48,54 @@ async function expectReject(fn, pattern) {
   return error;
 }
 
+
+function fixtureUuid(index) {
+  return `${index.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
+}
+
+async function writeRegistryHost(home, hostId, createdAtMs) {
+  await fs.mkdir(path.join(home, 'windows'), { recursive: true });
+  await fs.writeFile(
+    path.join(home, 'host.json'),
+    JSON.stringify({ version: 1, host_id: hostId, created_at: new Date(createdAtMs).toISOString() }) + '\n',
+    'utf8'
+  );
+}
+
+async function writeRegistryWindow(home, {
+  id,
+  hostId,
+  workspace,
+  startedAtMs,
+  stopped = true,
+  stopReason = 'MANUAL'
+}) {
+  const record = {
+    version: 1,
+    host_id: hostId,
+    work_window_id: id,
+    workspace_id: workspace.id,
+    workspace_root: workspace.root,
+    started_at: new Date(startedAtMs).toISOString(),
+    started_at_ms: startedAtMs,
+    drain_at: new Date(startedAtMs + WORK_WINDOW_ACTIVE_MS).toISOString(),
+    drain_at_ms: startedAtMs + WORK_WINDOW_ACTIVE_MS,
+    deadline: new Date(startedAtMs + WORK_WINDOW_DURATION_MS).toISOString(),
+    deadline_ms: startedAtMs + WORK_WINDOW_DURATION_MS,
+    ...(stopped
+      ? {
+          stopped_at: new Date(startedAtMs + WORK_WINDOW_DURATION_MS).toISOString(),
+          stopped_at_ms: startedAtMs + WORK_WINDOW_DURATION_MS,
+          stop_reason: stopReason
+        }
+      : {})
+  };
+  const pathname = path.join(home, 'windows', `${id}.json`);
+  const text = JSON.stringify(record, null, 2) + '\n';
+  await fs.writeFile(pathname, text, 'utf8');
+  return { pathname, text };
+}
+
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-work-window-'));
 const registry = path.join(tmp, 'work-windows');
 const workspaceA = { id: 'ws_a', root: path.join(tmp, 'workspace-a'), openedAt: new Date(0).toISOString() };
@@ -286,7 +334,143 @@ try {
   assert.equal(timerRecord.stop_reason, 'DEADLINE_AUTO');
   assert.equal(timerRecord.stopped_at, timerWindow.deadline);
 
-  console.log('work-window-guard-smoke: PASS (A-O)');
+  // P. Global capacity is serialized and sustainable: concurrent starts never create a 513th record.
+  const capacityHome = path.join(tmp, 'capacity-gate');
+  const capacityNow = 2_100_000_000_000;
+  const capacityHost = fixtureUuid(900_000);
+  await writeRegistryHost(capacityHome, capacityHost, capacityNow - 10_000);
+  await Promise.all(
+    Array.from({ length: 511 }, (_, index) =>
+      writeRegistryWindow(capacityHome, {
+        id: fixtureUuid(10_000 + index),
+        hostId: capacityHost,
+        workspace: workspaceA,
+        startedAtMs: capacityNow - 10_000_000 + index
+      })
+    )
+  );
+  const capacityLatestStoppedId = fixtureUuid(10_000 + 510);
+  const capacityGuardA = new WorkWindowGuard({
+    homeDir: capacityHome,
+    now: () => capacityNow,
+    uuid: sequenceUuid([fixtureUuid(910_001), fixtureUuid(910_003)])
+  });
+  const capacityGuardB = new WorkWindowGuard({
+    homeDir: capacityHome,
+    now: () => capacityNow,
+    uuid: sequenceUuid([fixtureUuid(910_002)])
+  });
+  const capacityStarts = await Promise.allSettled([
+    capacityGuardA.start(workspaceA),
+    capacityGuardB.start(workspaceB)
+  ]);
+  assert.equal(capacityStarts.filter((item) => item.status === 'fulfilled').length, 2);
+  assert.equal(
+    (await fs.readdir(path.join(capacityHome, 'windows'))).filter((name) => name.endsWith('.json')).length,
+    512
+  );
+  const capacityArchiveAfterConcurrent = (await fs.readdir(path.join(capacityHome, 'archive')))
+    .filter((name) => name.endsWith('.json'));
+  assert.equal(capacityArchiveAfterConcurrent.length, 1);
+  assert.equal(
+    (await fs.readdir(path.join(capacityHome, 'windows'))).includes(`${capacityLatestStoppedId}.json`),
+    true
+  );
+  await capacityGuardA.stop(workspaceA, capacityStarts[0].value.work_window_id);
+  await capacityGuardB.stop(workspaceB, capacityStarts[1].value.work_window_id);
+
+  // A full 512-record registry with reclaimable STOPPED history must not become permanently blocked.
+  const reclaimedStart = await capacityGuardA.start(workspaceA);
+  assert.equal(reclaimedStart.state, 'ACTIVE');
+  assert.equal(
+    (await fs.readdir(path.join(capacityHome, 'windows'))).filter((name) => name.endsWith('.json')).length,
+    512
+  );
+  assert.equal(
+    (await fs.readdir(path.join(capacityHome, 'archive'))).filter((name) => name.endsWith('.json')).length,
+    2
+  );
+  await capacityGuardA.stop(workspaceA, reclaimedStart.work_window_id);
+
+  // Q. Legacy 513+ bootstrap recovery reaches 512, then start reclaims one STOPPED and succeeds without 513.
+  const bootstrapHome = path.join(tmp, 'bootstrap-overflow');
+  const bootstrapNow = 2_200_000_000_000;
+  const bootstrapHost = fixtureUuid(920_000);
+  const bootstrapWorkspace = {
+    id: 'ws_bootstrap',
+    root: path.join(tmp, 'workspace-bootstrap'),
+    openedAt: new Date(0).toISOString()
+  };
+  await fs.mkdir(bootstrapWorkspace.root, { recursive: true });
+  await writeRegistryHost(bootstrapHome, bootstrapHost, bootstrapNow - 20_000);
+  let oldestStopped;
+  let secondOldestStopped;
+  for (let index = 0; index < 511; index += 1) {
+    const written = await writeRegistryWindow(bootstrapHome, {
+      id: fixtureUuid(20_000 + index),
+      hostId: bootstrapHost,
+      workspace: bootstrapWorkspace,
+      startedAtMs: bootstrapNow - 1_000_000_000 + index
+    });
+    if (index === 0) oldestStopped = { ...written, id: fixtureUuid(20_000) };
+    if (index === 1) secondOldestStopped = { ...written, id: fixtureUuid(20_001) };
+  }
+  const drainingId = fixtureUuid(930_001);
+  const activeId = fixtureUuid(930_002);
+  await writeRegistryWindow(bootstrapHome, {
+    id: drainingId,
+    hostId: bootstrapHost,
+    workspace: bootstrapWorkspace,
+    startedAtMs: bootstrapNow - WORK_WINDOW_ACTIVE_MS - 1_000,
+    stopped: false
+  });
+  await writeRegistryWindow(bootstrapHome, {
+    id: activeId,
+    hostId: bootstrapHost,
+    workspace: bootstrapWorkspace,
+    startedAtMs: bootstrapNow - 500,
+    stopped: false
+  });
+  const bootstrapGuard = new WorkWindowGuard({
+    homeDir: bootstrapHome,
+    now: () => bootstrapNow,
+    uuid: sequenceUuid([fixtureUuid(940_001)])
+  });
+  await bootstrapGuard.initialize();
+  let bootstrapRegistryNames = (await fs.readdir(path.join(bootstrapHome, 'windows')))
+    .filter((name) => name.endsWith('.json'));
+  assert.equal(bootstrapRegistryNames.length, 512);
+  assert(bootstrapRegistryNames.includes(`${drainingId}.json`));
+  assert(bootstrapRegistryNames.includes(`${activeId}.json`));
+  let archiveNames = (await fs.readdir(path.join(bootstrapHome, 'archive')))
+    .filter((name) => name.endsWith('.json')).sort();
+  assert.deepEqual(archiveNames, [`${oldestStopped.id}.json`]);
+  assert.equal(
+    await fs.readFile(path.join(bootstrapHome, 'archive', `${oldestStopped.id}.json`), 'utf8'),
+    oldestStopped.text
+  );
+
+  const bootstrapFresh = await bootstrapGuard.start(workspaceB);
+  assert.equal(bootstrapFresh.state, 'ACTIVE');
+  bootstrapRegistryNames = (await fs.readdir(path.join(bootstrapHome, 'windows')))
+    .filter((name) => name.endsWith('.json'));
+  assert.equal(bootstrapRegistryNames.length, 512);
+  assert(bootstrapRegistryNames.includes(`${drainingId}.json`));
+  assert(bootstrapRegistryNames.includes(`${activeId}.json`));
+  archiveNames = (await fs.readdir(path.join(bootstrapHome, 'archive')))
+    .filter((name) => name.endsWith('.json')).sort();
+  assert.deepEqual(archiveNames, [`${oldestStopped.id}.json`, `${secondOldestStopped.id}.json`].sort());
+  assert.equal(
+    await fs.readFile(path.join(bootstrapHome, 'archive', `${secondOldestStopped.id}.json`), 'utf8'),
+    secondOldestStopped.text
+  );
+  const bootstrapActive = await bootstrapGuard.listActive(bootstrapWorkspace);
+  assert.equal(bootstrapActive.length, 2);
+  assert.deepEqual(new Set(bootstrapActive.map((item) => item.state)), new Set(['ACTIVE', 'DRAINING']));
+  assert.equal(bootstrapRegistryNames.includes(`${bootstrapFresh.work_window_id}.json`), true);
+  await bootstrapGuard.stop(workspaceB, bootstrapFresh.work_window_id);
+
+  console.log('work-window-guard-smoke: PASS (A-Q)');
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });
 }
