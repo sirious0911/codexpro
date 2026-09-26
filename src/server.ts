@@ -163,6 +163,78 @@ function annotateWorkWindowBoundary(result: any, status: WorkWindowStatus): any 
   return result;
 }
 
+const TERMINAL_REPORT_SETTLE_MS = 5_000;
+
+function terminalReportContract(
+  status: WorkWindowStatus,
+  clientCapabilities: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  const deadlineMs = Date.parse(status.deadline);
+  if (!Number.isFinite(deadlineMs)) {
+    throw new Error(`Invalid Work Window deadline for terminal report: ${status.deadline}`);
+  }
+  const negotiatedClientCapabilityKeys = Object.keys(clientCapabilities ?? {}).sort();
+  return {
+    version: 1,
+    callback_key: `work-window-terminal-report:${status.work_window_id}`,
+    arm_once: true,
+    terminal_report_due_at: new Date(deadlineMs + TERMINAL_REPORT_SETTLE_MS).toISOString(),
+    delivery_intent: "same_conversation",
+    delivery_status: "BLOCKED_HOST_CONSUMER_UNAVAILABLE",
+    consumer_present: false,
+    host_scheduler_required: true,
+    user_setup_required: false,
+    blocked_evidence: {
+      capability_evidence_kind: "negotiated_mcp_client_capabilities",
+      negotiated_client_capability_keys: negotiatedClientCapabilityKeys,
+      static_sdk_surface_review: {
+        available_server_to_client_primitives: ["sampling/createMessage", "elicitation/create", "notifications/message"],
+        evidence_kind: "installed_sdk_runtime_surface"
+      },
+      candidates_reviewed: [
+        {
+          candidate: "MCP Tasks",
+          disposition: "excluded",
+          reason: "async task lifecycle/result/status support does not establish durable unattended future same-conversation wake/delivery"
+        },
+        {
+          candidate: "tool-card widget follow-up",
+          disposition: "excluded",
+          reason: "ui/notifications/tool-result updates an active widget host context and does not establish durable unattended future same-conversation wake/delivery"
+        }
+      ],
+      blocker: "durable unattended future same-conversation wake/delivery",
+      forbidden_fallback: "user Automations/reminder/alarm"
+    },
+    callback: {
+      tool: "work_window_status",
+      arguments: {
+        workspace_id: status.workspace_id,
+        work_window_id: status.work_window_id
+      },
+      read_only: true,
+      retry_count: 0,
+      polling: false,
+      self_reschedule: false
+    },
+    report: {
+      title_template: "<채팅방 이름> - 30분 타이머 종료로 추가진행 필요",
+      include_state_or_reason: true,
+      completed_max_items: 2,
+      include_pending: true,
+      include_resume_from: true,
+      next_actor: "사용자",
+      resume_instruction: "\"진행\" 요청 시 fresh Work Window로 재개 가능"
+    },
+    prohibitions: {
+      auto_resume: true,
+      auto_renew: true,
+      mutation_from_callback: true,
+      duplicate_arm: true
+    }
+  };
+}
+
 function terminalWorkspaceOrientationResult(workspace: Workspace, status: WorkWindowStatus): any {
   const fields = {
     workspace_id: workspace.id,
@@ -722,8 +794,8 @@ function serverInstructions(config: CodexProConfig): string {
       ? "5. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
       : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
   const workWindowInstruction = config.connectionTest
-    ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, or stop Work Windows."
-    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. In-flight cancellable work is aborted at drain; at deadline the durable Work Window record auto-terminalizes to STOPPED and is reconciled after restart. CodexPro cannot wake ChatGPT or send an unsolicited assistant message when that time arrives. Never auto-renew or self-start a replacement; only a new user work/resume message may justify a new explicit start_work_window call.";
+    ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, stop, advertise, or arm terminal-report callbacks."
+    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. In-flight cancellable work is aborted at drain; at deadline the durable Work Window record auto-terminalizes to STOPPED and is reconciled after restart. Every successful start_work_window returns exactly one terminal_report_contract. Treat delivery_status=BLOCKED_HOST_CONSUMER_UNAVAILABLE as authoritative: the current blocker is specifically the absence of an approved durable unattended future same-conversation wake/delivery primitive, not the absence of every same-conversation messaging surface. The contract records actual negotiated MCP client capability keys at start time. The installed SDK server-to-client primitives reviewed are sampling/createMessage, elicitation/create, and notifications/message. MCP Tasks were reviewed but async task lifecycle/result/status support does not establish a durable 30-minute unattended same-conversation wake; tool-card widget follow-up via ui/notifications/tool-result was also reviewed but depends on an active widget host context and does not establish that durable wake/delivery guarantee. User Automations/reminder/alarm is an explicitly forbidden fallback for this workflow. Never arm from status/list/checkpoint/stop results. A real automatic terminal chat report requires a separate approved non-Automations ChatGPT host primitive that guarantees durable unattended future same-conversation wake/delivery. Only a new user work/resume message may justify a new explicit start_work_window call.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
@@ -2550,6 +2622,10 @@ export function createCodexProServer(
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const status = await workWindowGuard.start(workspace, { sessionBinding: args.session_binding });
+      const terminalReport = terminalReportContract(
+        status,
+        server.server.getClientCapabilities() as Record<string, unknown> | undefined
+      );
       const text = [
         "# Start Work Window",
         "",
@@ -2557,10 +2633,15 @@ export function createCodexProServer(
         `State: ${status.state}`,
         `Drain at: ${status.drain_at_kst}`,
         `Deadline: ${status.deadline_kst}`,
+        `Terminal report due: ${terminalReport.terminal_report_due_at}`,
         "",
-        "Pass this exact work_window_id to write/edit/apply_patch/import_file/bash. Do not auto-renew it; a new Work Window requires a new user-authorized work/resume request."
+        "Pass this exact work_window_id to write/edit/apply_patch/import_file/bash. Do not auto-renew it; a new Work Window requires a new user-authorized work/resume request.",
+        "Automatic terminal chat report: BLOCKED_HOST_CONSUMER_UNAVAILABLE. CodexPro can emit the terminal_report_contract, but no approved durable unattended future same-conversation wake/delivery primitive has been established for this MCP/ChatGPT integration. MCP Tasks and tool-card widget follow-up were reviewed but do not provide that durability guarantee. User Automations/reminder/alarm is not an allowed fallback."
       ].join("\n");
-      return textResult(text, status as unknown as Record<string, unknown>);
+      return textResult(text, {
+        ...(status as unknown as Record<string, unknown>),
+        terminal_report_contract: terminalReport
+      });
     }
   );
 

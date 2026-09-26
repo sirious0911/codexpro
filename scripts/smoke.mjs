@@ -81,6 +81,59 @@ class McpStdioClient {
   }
 }
 
+function assertNoTerminalReportContract(result, label) {
+  if (result?.structuredContent && 'terminal_report_contract' in result.structuredContent) {
+    throw new Error(`${label} unexpectedly exposed terminal_report_contract: ${JSON.stringify(result)}`);
+  }
+}
+
+function assertTerminalReportContract(started) {
+  const structured = started?.structuredContent ?? {};
+  const contract = structured.terminal_report_contract;
+  const deadlineMs = Date.parse(structured.deadline);
+  if (
+    !contract ||
+    contract.version !== 1 ||
+    contract.callback_key !== `work-window-terminal-report:${structured.work_window_id}` ||
+    contract.arm_once !== true ||
+    contract.terminal_report_due_at !== new Date(deadlineMs + 5000).toISOString() ||
+    contract.delivery_intent !== 'same_conversation' ||
+    contract.delivery_status !== 'BLOCKED_HOST_CONSUMER_UNAVAILABLE' ||
+    contract.consumer_present !== false ||
+    contract.host_scheduler_required !== true ||
+    contract.user_setup_required !== false ||
+    contract.blocked_evidence?.capability_evidence_kind !== 'negotiated_mcp_client_capabilities' ||
+    JSON.stringify(contract.blocked_evidence?.negotiated_client_capability_keys) !== JSON.stringify(['sampling']) ||
+    JSON.stringify(contract.blocked_evidence?.static_sdk_surface_review?.available_server_to_client_primitives) !== JSON.stringify(['sampling/createMessage', 'elicitation/create', 'notifications/message']) ||
+    contract.blocked_evidence?.static_sdk_surface_review?.evidence_kind !== 'installed_sdk_runtime_surface' ||
+    contract.blocked_evidence?.candidates_reviewed?.[0]?.candidate !== 'MCP Tasks' ||
+    contract.blocked_evidence?.candidates_reviewed?.[0]?.disposition !== 'excluded' ||
+    !contract.blocked_evidence?.candidates_reviewed?.[0]?.reason?.includes('durable unattended future same-conversation wake/delivery') ||
+    contract.blocked_evidence?.candidates_reviewed?.[1]?.candidate !== 'tool-card widget follow-up' ||
+    contract.blocked_evidence?.candidates_reviewed?.[1]?.disposition !== 'excluded' ||
+    !contract.blocked_evidence?.candidates_reviewed?.[1]?.reason?.includes('durable unattended future same-conversation wake/delivery') ||
+    contract.blocked_evidence?.blocker !== 'durable unattended future same-conversation wake/delivery' ||
+    contract.blocked_evidence?.forbidden_fallback !== 'user Automations/reminder/alarm' ||
+    contract.callback?.tool !== 'work_window_status' ||
+    contract.callback?.arguments?.workspace_id !== structured.workspace_id ||
+    contract.callback?.arguments?.work_window_id !== structured.work_window_id ||
+    contract.callback?.read_only !== true ||
+    contract.callback?.retry_count !== 0 ||
+    contract.callback?.polling !== false ||
+    contract.callback?.self_reschedule !== false ||
+    contract.report?.title_template !== '<채팅방 이름> - 30분 타이머 종료로 추가진행 필요' ||
+    contract.report?.completed_max_items !== 2 ||
+    contract.report?.next_actor !== '사용자' ||
+    contract.prohibitions?.auto_resume !== true ||
+    contract.prohibitions?.auto_renew !== true ||
+    contract.prohibitions?.mutation_from_callback !== true ||
+    contract.prohibitions?.duplicate_arm !== true
+  ) {
+    throw new Error(`terminal_report_contract mismatch: ${JSON.stringify(started)}`);
+  }
+  return contract;
+}
+
 async function startClientWorkWindow(targetClient, workspaceId) {
   const started = await targetClient.request('tools/call', {
     name: 'start_work_window',
@@ -89,6 +142,7 @@ async function startClientWorkWindow(targetClient, workspaceId) {
   if (started.isError || started.structuredContent?.state !== 'ACTIVE') {
     throw new Error(`start_work_window failed: ${JSON.stringify(started)}`);
   }
+  assertTerminalReportContract(started);
   targetClient.workWindowId = started.structuredContent.work_window_id;
   return started;
 }
@@ -288,11 +342,23 @@ const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--al
   }
 });
 
-await client.request('initialize', {
+const initialized = await client.request('initialize', {
   protocolVersion: '2024-11-05',
-  capabilities: {},
+  capabilities: { sampling: {} },
   clientInfo: { name: 'codexpro-smoke', version: '0.1.0' }
 });
+if (
+  !initialized.instructions?.includes('Every successful start_work_window returns exactly one terminal_report_contract') ||
+  !initialized.instructions?.includes('BLOCKED_HOST_CONSUMER_UNAVAILABLE') ||
+  !initialized.instructions?.includes('absence of an approved durable unattended future same-conversation wake/delivery primitive') ||
+  !initialized.instructions?.includes('records actual negotiated MCP client capability keys at start time') ||
+  !initialized.instructions?.includes('MCP Tasks were reviewed') ||
+  !initialized.instructions?.includes('tool-card widget follow-up via ui/notifications/tool-result was also reviewed') ||
+  !initialized.instructions?.includes('User Automations/reminder/alarm is an explicitly forbidden fallback') ||
+  !initialized.instructions?.includes('Never arm from status/list/checkpoint/stop results')
+) {
+  throw new Error(`server instructions missing terminal-report workflow: ${JSON.stringify(initialized.instructions)}`);
+}
 client.notify('notifications/initialized');
 const tools = await client.request('tools/list', {});
 const toolNames = tools.tools.map((tool) => tool.name);
@@ -593,6 +659,16 @@ if (!missingSuperWindow.isError || !/work_window_id|Invalid arguments/i.test(JSO
 const wrongWindowId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 await expectToolError('write', { workspace_id: ws, work_window_id: wrongWindowId, path: 'window-wrong.txt', content: 'blocked\n' }, /host identity|not found/i);
 const activeWorkWindow = await startClientWorkWindow(client, ws);
+const activeWindowStatus = await client.request('tools/call', {
+  name: 'work_window_status',
+  arguments: { workspace_id: ws, work_window_id: activeWorkWindow.structuredContent.work_window_id }
+});
+assertNoTerminalReportContract(activeWindowStatus, 'work_window_status');
+const activeWindowList = await client.request('tools/call', {
+  name: 'list_active_work_windows',
+  arguments: { workspace_id: ws }
+});
+assertNoTerminalReportContract(activeWindowList, 'list_active_work_windows');
 await expectToolError('edit', {
   workspace_id: ws,
   work_window_id: wrongWindowId,
@@ -728,6 +804,7 @@ const expiredCheckpoint = await client.request('tools/call', {
     resume_from: 'STOPPED'
   }
 });
+assertNoTerminalReportContract(expiredCheckpoint, 'checkpoint_work_window');
 if (
   expiredCheckpoint.isError ||
   expiredCheckpoint.structuredContent?.state !== 'STOPPED' ||
@@ -2529,11 +2606,17 @@ const connectionTestClient = new McpStdioClient('node', ['dist/stdio.js', '--roo
   cwd: path.resolve('.'),
   env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_CONNECTION_TEST: '1' }
 });
-await connectionTestClient.request('initialize', {
+const connectionInitialized = await connectionTestClient.request('initialize', {
   protocolVersion: '2024-11-05',
   capabilities: {},
   clientInfo: { name: 'codexpro-connection-test-window-smoke', version: '0.1.0' }
 });
+if (
+  !connectionInitialized.instructions?.includes('must not start, checkpoint, stop, advertise, or arm terminal-report callbacks') ||
+  connectionInitialized.instructions?.includes('Every successful start_work_window returns exactly one terminal_report_contract')
+) {
+  throw new Error(`connection-test terminal-report instructions regressed: ${JSON.stringify(connectionInitialized.instructions)}`);
+}
 connectionTestClient.notify('notifications/initialized');
 const connectionTools = await connectionTestClient.request('tools/list', {});
 const connectionNames = connectionTools.tools.map((tool) => tool.name);
