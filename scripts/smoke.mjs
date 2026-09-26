@@ -66,7 +66,7 @@ class McpStdioClient {
     const msg = { jsonrpc: '2.0', id, method, params: effectiveParams };
     this.child.stdin.write(encode(msg));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 15000);
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}${params?.name ? `:${params.name}` : ''}`)), 15000);
       timer.unref();
       this.pending.set(id, { resolve, reject, timer });
     });
@@ -81,13 +81,40 @@ class McpStdioClient {
   }
 }
 
+function assertNoStartNotice(result, label) {
+  const structured = result?.structuredContent ?? {};
+  const text = result?.content?.find?.((item) => item.type === 'text')?.text ?? '';
+  if ('work_window_user_notice' in structured || text.includes('Work Window 시작:')) {
+    throw new Error(`${label} unexpectedly exposed work_window_user_notice: ${JSON.stringify(result)}`);
+  }
+}
+
 function assertNoTerminalReportContract(result, label) {
   if (result?.structuredContent && 'terminal_report_contract' in result.structuredContent) {
     throw new Error(`${label} unexpectedly exposed terminal_report_contract: ${JSON.stringify(result)}`);
   }
 }
 
-function assertTerminalReportContract(started) {
+function assertStartNotice(started) {
+  const structured = started?.structuredContent ?? {};
+  const startedMatch = /^(?:\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}):\d{2} KST$/.exec(structured.started_at_kst ?? '');
+  const deadlineMatch = /^(?:\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}):\d{2} KST$/.exec(structured.deadline_kst ?? '');
+  if (!startedMatch || !deadlineMatch) {
+    throw new Error(`start notice source timestamp mismatch: ${JSON.stringify(started)}`);
+  }
+  const expected = `Work Window 시작: ${startedMatch[1]} / 종료 예정: ${deadlineMatch[1]} KST`;
+  const text = started?.content?.find?.((item) => item.type === 'text')?.text ?? '';
+  const structuredCount = Object.keys(structured).filter((key) => key === 'work_window_user_notice').length;
+  const textCount = text.split(expected).length - 1;
+  if (structured.work_window_user_notice !== expected || structuredCount !== 1 || textCount !== 0) {
+    throw new Error(
+      `work_window_user_notice mismatch: expected=${expected} structuredCount=${structuredCount} textCount=${textCount} result=${JSON.stringify(started)}`
+    );
+  }
+  return expected;
+}
+
+function assertTerminalReportContract(started, expectedClientCapabilityKeys) {
   const structured = started?.structuredContent ?? {};
   const contract = structured.terminal_report_contract;
   const deadlineMs = Date.parse(structured.deadline);
@@ -103,7 +130,7 @@ function assertTerminalReportContract(started) {
     contract.host_scheduler_required !== true ||
     contract.user_setup_required !== false ||
     contract.blocked_evidence?.capability_evidence_kind !== 'negotiated_mcp_client_capabilities' ||
-    JSON.stringify(contract.blocked_evidence?.negotiated_client_capability_keys) !== JSON.stringify(['sampling']) ||
+    JSON.stringify(contract.blocked_evidence?.negotiated_client_capability_keys) !== JSON.stringify(expectedClientCapabilityKeys) ||
     JSON.stringify(contract.blocked_evidence?.static_sdk_surface_review?.available_server_to_client_primitives) !== JSON.stringify(['sampling/createMessage', 'elicitation/create', 'notifications/message']) ||
     contract.blocked_evidence?.static_sdk_surface_review?.evidence_kind !== 'installed_sdk_runtime_surface' ||
     contract.blocked_evidence?.candidates_reviewed?.[0]?.candidate !== 'MCP Tasks' ||
@@ -134,7 +161,7 @@ function assertTerminalReportContract(started) {
   return contract;
 }
 
-async function startClientWorkWindow(targetClient, workspaceId) {
+async function startClientWorkWindow(targetClient, workspaceId, expectedClientCapabilityKeys = []) {
   const started = await targetClient.request('tools/call', {
     name: 'start_work_window',
     arguments: { ...(workspaceId ? { workspace_id: workspaceId } : {}), session_binding: 'smoke-client' }
@@ -142,7 +169,8 @@ async function startClientWorkWindow(targetClient, workspaceId) {
   if (started.isError || started.structuredContent?.state !== 'ACTIVE') {
     throw new Error(`start_work_window failed: ${JSON.stringify(started)}`);
   }
-  assertTerminalReportContract(started);
+  assertStartNotice(started);
+  assertTerminalReportContract(started, expectedClientCapabilityKeys);
   targetClient.workWindowId = started.structuredContent.work_window_id;
   return started;
 }
@@ -348,7 +376,11 @@ const initialized = await client.request('initialize', {
   clientInfo: { name: 'codexpro-smoke', version: '0.1.0' }
 });
 if (
-  !initialized.instructions?.includes('Every successful start_work_window returns exactly one terminal_report_contract') ||
+  !initialized.instructions?.includes('Every successful start_work_window returns work_window_user_notice generated only from that Work Window\'s started_at_kst and deadline_kst') ||
+  !initialized.instructions?.includes('Copy that notice verbatim into the user-facing assistant response exactly once') ||
+  !initialized.instructions?.includes('do not calculate, infer, or reformat the times yourself') ||
+  !initialized.instructions?.includes('Never repeat a start notice from work_window_status, list_active_work_windows, checkpoint_work_window, or stop_work_window') ||
+  !initialized.instructions?.includes('every successful start_work_window also returns exactly one terminal_report_contract') ||
   !initialized.instructions?.includes('BLOCKED_HOST_CONSUMER_UNAVAILABLE') ||
   !initialized.instructions?.includes('absence of an approved durable unattended future same-conversation wake/delivery primitive') ||
   !initialized.instructions?.includes('records actual negotiated MCP client capability keys at start time') ||
@@ -658,16 +690,18 @@ if (!missingSuperWindow.isError || !/work_window_id|Invalid arguments/i.test(JSO
 }
 const wrongWindowId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 await expectToolError('write', { workspace_id: ws, work_window_id: wrongWindowId, path: 'window-wrong.txt', content: 'blocked\n' }, /host identity|not found/i);
-const activeWorkWindow = await startClientWorkWindow(client, ws);
+const activeWorkWindow = await startClientWorkWindow(client, ws, ['sampling']);
 const activeWindowStatus = await client.request('tools/call', {
   name: 'work_window_status',
   arguments: { workspace_id: ws, work_window_id: activeWorkWindow.structuredContent.work_window_id }
 });
+assertNoStartNotice(activeWindowStatus, 'work_window_status');
 assertNoTerminalReportContract(activeWindowStatus, 'work_window_status');
 const activeWindowList = await client.request('tools/call', {
   name: 'list_active_work_windows',
   arguments: { workspace_id: ws }
 });
+assertNoStartNotice(activeWindowList, 'list_active_work_windows');
 assertNoTerminalReportContract(activeWindowList, 'list_active_work_windows');
 await expectToolError('edit', {
   workspace_id: ws,
@@ -804,6 +838,7 @@ const expiredCheckpoint = await client.request('tools/call', {
     resume_from: 'STOPPED'
   }
 });
+assertNoStartNotice(expiredCheckpoint, 'checkpoint_work_window');
 assertNoTerminalReportContract(expiredCheckpoint, 'checkpoint_work_window');
 if (
   expiredCheckpoint.isError ||
@@ -855,6 +890,8 @@ if (concurrentWinners.length !== 1 || concurrentLosers.length !== 2) {
   throw new Error(`same-workspace concurrent start was not exact1: ${JSON.stringify(concurrentStarts)}`);
 }
 const alternateActive = concurrentWinners[0];
+assertStartNotice(alternateActive);
+assertTerminalReportContract(alternateActive, ['sampling']);
 if (alternateActive.structuredContent.work_window_id === expiredWindowId) {
   throw new Error('fresh start reused expired Work Window id');
 }
@@ -865,13 +902,14 @@ const resumedAlternateRead = await client.request('tools/call', {
 if (resumedAlternateRead.isError) {
   throw new Error(`fresh explicit start did not restore alternate workspace work: ${JSON.stringify(resumedAlternateRead)}`);
 }
-await client.request('tools/call', {
+const alternateStopped = await client.request('tools/call', {
   name: 'stop_work_window',
   arguments: {
     workspace_id: alternate.structuredContent.workspace_id,
     work_window_id: alternateActive.structuredContent.work_window_id
   }
 });
+assertNoStartNotice(alternateStopped, 'stop_work_window');
 
 const restartClient = new McpStdioClient(
   'node',
@@ -1129,6 +1167,7 @@ const nearDrainCheckpoint = await client.request('tools/call', {
     resume_from: 'STOPPED'
   }
 });
+assertNoStartNotice(nearDrainCheckpoint, 'checkpoint_work_window draining');
 if (
   nearDrainCheckpoint.isError ||
   nearDrainCheckpoint.structuredContent?.state !== 'STOPPED' ||
@@ -2612,10 +2651,12 @@ const connectionInitialized = await connectionTestClient.request('initialize', {
   clientInfo: { name: 'codexpro-connection-test-window-smoke', version: '0.1.0' }
 });
 if (
-  !connectionInitialized.instructions?.includes('must not start, checkpoint, stop, advertise, or arm terminal-report callbacks') ||
+  !connectionInitialized.instructions?.includes('must not start, checkpoint, stop, advertise a start notice, or arm terminal-report callbacks') ||
+  connectionInitialized.instructions?.includes('work_window_user_notice') ||
+  connectionInitialized.instructions?.includes('Copy that notice verbatim') ||
   connectionInitialized.instructions?.includes('Every successful start_work_window returns exactly one terminal_report_contract')
 ) {
-  throw new Error(`connection-test terminal-report instructions regressed: ${JSON.stringify(connectionInitialized.instructions)}`);
+  throw new Error(`connection-test Work Window instructions regressed: ${JSON.stringify(connectionInitialized.instructions)}`);
 }
 connectionTestClient.notify('notifications/initialized');
 const connectionTools = await connectionTestClient.request('tools/list', {});
@@ -2631,6 +2672,7 @@ const connectionList = await connectionTestClient.request('tools/call', {
   name: 'list_active_work_windows',
   arguments: { workspace_id: connectionOpened.structuredContent.workspace_id }
 });
+assertNoStartNotice(connectionList, 'connection-test list_active_work_windows');
 if (connectionList.isError || !Array.isArray(connectionList.structuredContent.windows)) {
   throw new Error(`connection-test list_active_work_windows failed: ${JSON.stringify(connectionList)}`);
 }

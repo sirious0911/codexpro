@@ -163,6 +163,17 @@ function annotateWorkWindowBoundary(result: any, status: WorkWindowStatus): any 
   return result;
 }
 
+function workWindowUserNotice(status: WorkWindowStatus): string {
+  const started = /^(?:\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}):\d{2} KST$/.exec(status.started_at_kst);
+  const deadline = /^(?:\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}):\d{2} KST$/.exec(status.deadline_kst);
+  if (!started || !deadline) {
+    throw new Error(
+      `Invalid Work Window KST timestamps for user notice: started_at_kst=${status.started_at_kst}, deadline_kst=${status.deadline_kst}`
+    );
+  }
+  return `Work Window 시작: ${started[1]} / 종료 예정: ${deadline[1]} KST`;
+}
+
 const TERMINAL_REPORT_SETTLE_MS = 5_000;
 
 function terminalReportContract(
@@ -794,8 +805,8 @@ function serverInstructions(config: CodexProConfig): string {
       ? "5. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
       : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
   const workWindowInstruction = config.connectionTest
-    ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, stop, advertise, or arm terminal-report callbacks."
-    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. In-flight cancellable work is aborted at drain; at deadline the durable Work Window record auto-terminalizes to STOPPED and is reconciled after restart. Every successful start_work_window returns exactly one terminal_report_contract. Treat delivery_status=BLOCKED_HOST_CONSUMER_UNAVAILABLE as authoritative: the current blocker is specifically the absence of an approved durable unattended future same-conversation wake/delivery primitive, not the absence of every same-conversation messaging surface. The contract records actual negotiated MCP client capability keys at start time. The installed SDK server-to-client primitives reviewed are sampling/createMessage, elicitation/create, and notifications/message. MCP Tasks were reviewed but async task lifecycle/result/status support does not establish a durable 30-minute unattended same-conversation wake; tool-card widget follow-up via ui/notifications/tool-result was also reviewed but depends on an active widget host context and does not establish that durable wake/delivery guarantee. User Automations/reminder/alarm is an explicitly forbidden fallback for this workflow. Never arm from status/list/checkpoint/stop results. A real automatic terminal chat report requires a separate approved non-Automations ChatGPT host primitive that guarantees durable unattended future same-conversation wake/delivery. Only a new user work/resume message may justify a new explicit start_work_window call.";
+    ? "6. Connection test mode may inspect Work Window status/list only. It must not start, checkpoint, stop, advertise a start notice, or arm terminal-report callbacks."
+    : "6. For a new user-authorized substantive work/resume request, call start_work_window once. ACTIVE lasts 27 minutes. DRAINING is terminal report reserve: do not continue read/search/validation work; checkpoint and stop/report instead. In-flight cancellable work is aborted at drain; at deadline the durable Work Window record auto-terminalizes to STOPPED and is reconciled after restart. Every successful start_work_window returns work_window_user_notice generated only from that Work Window's started_at_kst and deadline_kst. Copy that notice verbatim into the user-facing assistant response exactly once; do not calculate, infer, or reformat the times yourself. Never repeat a start notice from work_window_status, list_active_work_windows, checkpoint_work_window, or stop_work_window. This start notice is independent from terminal delivery: every successful start_work_window also returns exactly one terminal_report_contract. Treat delivery_status=BLOCKED_HOST_CONSUMER_UNAVAILABLE as authoritative: the current blocker is specifically the absence of an approved durable unattended future same-conversation wake/delivery primitive, not the absence of every same-conversation messaging surface. The contract records actual negotiated MCP client capability keys at start time. The installed SDK server-to-client primitives reviewed are sampling/createMessage, elicitation/create, and notifications/message. MCP Tasks were reviewed but async task lifecycle/result/status support does not establish a durable 30-minute unattended same-conversation wake; tool-card widget follow-up via ui/notifications/tool-result was also reviewed but depends on an active widget host context and does not establish that durable wake/delivery guarantee. User Automations/reminder/alarm is an explicitly forbidden fallback for this workflow. Never arm from status/list/checkpoint/stop results. A real automatic terminal chat report requires a separate approved non-Automations ChatGPT host primitive that guarantees durable unattended future same-conversation wake/delivery. Only a new user work/resume message may justify a new explicit start_work_window call.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
@@ -2622,6 +2633,7 @@ export function createCodexProServer(
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const status = await workWindowGuard.start(workspace, { sessionBinding: args.session_binding });
+      const userNotice = workWindowUserNotice(status);
       const terminalReport = terminalReportContract(
         status,
         server.server.getClientCapabilities() as Record<string, unknown> | undefined
@@ -2640,6 +2652,7 @@ export function createCodexProServer(
       ].join("\n");
       return textResult(text, {
         ...(status as unknown as Record<string, unknown>),
+        work_window_user_notice: userNotice,
         terminal_report_contract: terminalReport
       });
     }
