@@ -2087,6 +2087,143 @@ await assertToolMode('', ['codexpro', 'server_config', 'codexpro_self_test', 'op
 await assertToolMode('minimal', ['codexpro', 'server_config', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'read', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes'], ['inspect_workspace', 'tree', 'search', 'load_skill', 'view_image', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context']);
 await assertToolMode('', ['codexpro', 'server_config', 'show_changes', 'search'], ['inspect_workspace'], { CODEXPRO_ANALYSIS: '0' });
 
+const directBindingWorkspace = path.join(tmp, 'host-direct-binding-alt');
+const directBindingHome = path.join(tmp, 'host-direct-binding-home');
+await fs.mkdir(directBindingWorkspace, { recursive: true });
+await fs.mkdir(directBindingHome, { recursive: true });
+const directBindingClient = new McpStdioClient(
+  'node',
+  ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--tool-mode', 'full'],
+  {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CODEXPRO_ROOT: tmp,
+      CODEXPRO_ALLOWED_ROOTS: tmp,
+      CODEXPRO_HOME: directBindingHome,
+      CODEXPRO_LOCAL_CAPABILITIES: 'full'
+    }
+  }
+);
+await directBindingClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-host-direct-binding-smoke', version: '0.1.0' }
+});
+directBindingClient.notify('notifications/initialized');
+
+const directDefault = await directBindingClient.request('tools/call', {
+  name: 'open_current_workspace',
+  arguments: { include_tree: false }
+});
+const directDefaultId = directDefault.structuredContent.workspace_id;
+const directDefaultWindow = await directBindingClient.request('tools/call', {
+  name: 'start_work_window',
+  arguments: { workspace_id: directDefaultId, session_binding: 'host-direct-stale-default' }
+});
+await directBindingClient.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: directDefaultId,
+    work_window_id: directDefaultWindow.structuredContent.work_window_id
+  }
+});
+const directActive = await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: directBindingWorkspace, include_tree: false }
+});
+const directActiveId = directActive.structuredContent.workspace_id;
+await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: tmp, include_tree: false }
+});
+const directActiveWindow = await directBindingClient.request('tools/call', {
+  name: 'start_work_window',
+  arguments: { workspace_id: directActiveId, session_binding: 'host-direct-explicit-active' }
+});
+
+const directOnlyCases = [
+  ['codexpro_controlled_handover', { confirm: 'CODEXPRO_CONTROLLED_HANDOVER', dry_run: true }],
+  ['shutdown_windows', { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }],
+  ['reboot_windows', { confirm: 'REBOOT_WINDOWS', dry_run: true }],
+  ['start_dedicated_chrome', { confirm: 'START_DEDICATED_CHROME_CDP', dry_run: true }],
+  ['windows_power_action', { action: 'shutdown', confirm: 'SHUTDOWN_WINDOWS', dry_run: true }],
+  ['windows_desktop_ui', { actions: [{ type: 'POINTER_MOVE', x: 0, y: 0 }], dry_run: true }]
+];
+for (const [name, baseArgs] of directOnlyCases) {
+  const missing = await directBindingClient.request('tools/call', { name, arguments: baseArgs });
+  if (!missing.isError || !/workspace_id|invalid arguments/i.test(JSON.stringify(missing))) {
+    throw new Error(`${name} missing explicit workspace binding did not fail closed: ${JSON.stringify(missing)}`);
+  }
+
+  const stale = await directBindingClient.request('tools/call', {
+    name,
+    arguments: { workspace_id: directDefaultId, ...baseArgs }
+  });
+  if (
+    !stale.isError ||
+    stale.structuredContent?.must_stop !== true ||
+    stale.structuredContent?.work_window_state !== 'STOPPED'
+  ) {
+    throw new Error(`${name} stale explicit workspace binding did not fail closed: ${JSON.stringify(stale)}`);
+  }
+
+  const active = await directBindingClient.request('tools/call', {
+    name,
+    arguments: { workspace_id: directActiveId, ...baseArgs }
+  });
+  if (
+    active.structuredContent?.must_stop === true ||
+    /Work Window .*STOPPED|requires an explicit workspace_id for Work Window binding/i.test(JSON.stringify(active))
+  ) {
+    throw new Error(`${name} did not use its explicit ACTIVE workspace binding: ${JSON.stringify(active)}`);
+  }
+}
+
+const shutdownExplicitActive = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { workspace_id: directActiveId, confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (shutdownExplicitActive.isError || shutdownExplicitActive.structuredContent?.status !== 'DRY_RUN') {
+  throw new Error(`shutdown dry-run did not pass with stale selected workspace + explicit ACTIVE workspace: ${JSON.stringify(shutdownExplicitActive)}`);
+}
+
+const stoppedDiagnosticProbe = await directBindingClient.request('tools/call', {
+  name: 'local_runtime_probe',
+  arguments: {}
+});
+if (stoppedDiagnosticProbe.isError || stoppedDiagnosticProbe.structuredContent?.must_stop === true) {
+  throw new Error(`local_runtime_probe was not Work Window gate-exempt: ${JSON.stringify(stoppedDiagnosticProbe)}`);
+}
+const stoppedDiagnosticSnapshot = await directBindingClient.request('tools/call', {
+  name: 'windows_system_snapshot',
+  arguments: {}
+});
+if (stoppedDiagnosticSnapshot.isError || stoppedDiagnosticSnapshot.structuredContent?.must_stop === true) {
+  throw new Error(`windows_system_snapshot was not Work Window gate-exempt: ${JSON.stringify(stoppedDiagnosticSnapshot)}`);
+}
+
+const ordinaryStoppedRead = await directBindingClient.request('tools/call', {
+  name: 'read',
+  arguments: { workspace_id: directDefaultId, path: 'demo.txt' }
+});
+if (
+  !ordinaryStoppedRead.isError ||
+  ordinaryStoppedRead.structuredContent?.must_stop !== true ||
+  ordinaryStoppedRead.structuredContent?.work_window_state !== 'STOPPED'
+) {
+  throw new Error(`ordinary source read unexpectedly bypassed Work Window gate: ${JSON.stringify(ordinaryStoppedRead)}`);
+}
+
+await directBindingClient.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: directActiveId,
+    work_window_id: directActiveWindow.structuredContent.work_window_id
+  }
+});
+directBindingClient.close();
+
 const handoffWriteClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--write', 'handoff'], {
   cwd: path.resolve('.'),
   env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_MODE: '' }
