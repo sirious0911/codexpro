@@ -133,12 +133,35 @@ export class WorkspaceManager {
     return workspace;
   }
 
+  getSelectedWorkspaceStrict(): Workspace | undefined {
+    const id = this.selectedWorkspaceId;
+    if (!id) return undefined;
+    const workspace = this.workspaces.get(id);
+    if (!workspace) {
+      this.selectedWorkspaceId = undefined;
+      return undefined;
+    }
+    try {
+      const stat = fs.statSync(workspace.root);
+      const realRoot = fs.realpathSync.native(workspace.root);
+      const allowed =
+        stat.isDirectory() && this.config.allowedRoots.some((allowedRoot) => isSubpath(realRoot, allowedRoot));
+      if (!allowed || workspaceIdForRoot(realRoot) !== id || workspace.root !== realRoot) {
+        throw new Error("stale selected workspace root");
+      }
+      return workspace;
+    } catch {
+      this.workspaces.delete(id);
+      this.registry.delete(id);
+      this.selectedWorkspaceId = undefined;
+      return undefined;
+    }
+  }
+
   getWorkspace(id?: string): Workspace {
     if (!id) {
-      if (this.selectedWorkspaceId) {
-        const selected = this.workspaces.get(this.selectedWorkspaceId);
-        if (selected) return selected;
-      }
+      const selected = this.getSelectedWorkspaceStrict();
+      if (selected) return selected;
       return this.selectDefaultWorkspace();
     }
     let workspace = this.workspaces.get(id) ?? this.registry.get(id);

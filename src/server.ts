@@ -1301,24 +1301,32 @@ export function createCodexProServer(
       const workspaceId = typeof args?.workspace_id === "string" ? args.workspace_id.trim() : "";
       let workspace: Workspace;
       if (hostBoundTool && !workspaceId) {
-        const candidates = await workWindowGuard.listGlobalNonTerminal();
+        const selected = workspaces.getSelectedWorkspaceStrict();
+        if (!selected) {
+          throw new CodexProError(
+            `${name} omitted workspace_id for backward compatibility, but this MCP session has no strict selected workspace. Call open_workspace or open_current_workspace first; default workspace fallback and cross-workspace inference are forbidden.`
+          );
+        }
+        const candidates = (await workWindowGuard.listGlobalNonTerminal()).filter(
+          (candidate) => candidate.workspace_id === selected.id && candidate.workspace_root === selected.root
+        );
         if (candidates.length === 0) {
           throw new CodexProError(
-            `${name} omitted workspace_id for backward compatibility, but there is no global non-terminal Work Window to bind. Selected/default workspace fallback is forbidden.`
+            `${name} omitted workspace_id for backward compatibility, but the strict selected workspace has no non-terminal Work Window. Default workspace fallback and cross-workspace inference are forbidden.`
           );
         }
         if (candidates.length !== 1) {
           throw new CodexProError(
-            `${name} omitted workspace_id for backward compatibility, but global Work Window binding is ambiguous across ${candidates.length} non-terminal candidates. Selected/default workspace fallback is forbidden.`
+            `${name} omitted workspace_id for backward compatibility, but the strict selected workspace has ${candidates.length} non-terminal Work Windows. Binding is ambiguous within the selected workspace.`
           );
         }
         const candidate = candidates[0];
-        workspace = workspaces.openWorkspace(candidate.workspace_root, { select: false });
-        if (workspace.id !== candidate.workspace_id || workspace.root !== candidate.workspace_root) {
+        if (selected.id !== candidate.workspace_id || selected.root !== candidate.workspace_root) {
           throw new CodexProError(
-            `${name} backward-compatible Work Window binding failed workspace id/root cross-validation.`
+            `${name} backward-compatible Work Window binding failed selected workspace id/root cross-validation.`
           );
         }
+        workspace = selected;
       } else {
         workspace = workspaces.getWorkspace(workspaceId || undefined);
       }
@@ -1490,7 +1498,7 @@ export function createCodexProServer(
       description:
         "Request one controlled self-handover of the active personal DUAL supervisor. Requires exact confirmation CODEXPRO_CONTROLLED_HANDOVER. dry_run defaults to true. The tool writes only one fixed local control request; the supervisor owns cleanup, lock release, canonical relaunch, and fallback. Never retry automatically after REQUESTED.",
       inputSchema: {
-        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission exists only for backward compatibility and succeeds only when exactly one global non-terminal Work Window exists; selected/default workspace fallback is forbidden."),
+        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission is supported only for stale connector compatibility and binds only to the workspace explicitly selected in this MCP session after open_workspace/open_current_workspace; default workspace fallback and cross-workspace inference are forbidden."),
         confirm: z.string().describe("Exact confirmation string: CODEXPRO_CONTROLLED_HANDOVER."),
         dry_run: z.boolean().optional().describe("Default: true. Validate current DUAL supervisor/lock/launcher state without writing the control request.")
       },
@@ -1521,7 +1529,7 @@ export function createCodexProServer(
       title: "Shutdown Windows",
       description: "Shut down this Windows PC through shutdown.exe. Requires exact confirmation SHUTDOWN_WINDOWS. dry_run defaults to true. Uses the normal non-force shutdown first; only Windows error 1271 (machine locked) permits exactly one /f fallback. Other failures are never retried automatically.",
       inputSchema: {
-        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission exists only for backward compatibility and succeeds only when exactly one global non-terminal Work Window exists; selected/default workspace fallback is forbidden."),
+        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission is supported only for stale connector compatibility and binds only to the workspace explicitly selected in this MCP session after open_workspace/open_current_workspace; default workspace fallback and cross-workspace inference are forbidden."),
         confirm: z.string().describe("Exact confirmation string: SHUTDOWN_WINDOWS."),
         dry_run: z.boolean().optional().describe("Default: true. Validate and return the exact shutdown plan without executing it.")
       },
@@ -1547,7 +1555,7 @@ export function createCodexProServer(
       title: "Reboot Windows",
       description: "Reboot this Windows PC through shutdown.exe. Requires exact confirmation REBOOT_WINDOWS. dry_run defaults to true. Uses the normal non-force reboot first; only Windows error 1271 (machine locked) permits exactly one /f fallback. Other failures are never retried automatically.",
       inputSchema: {
-        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission exists only for backward compatibility and succeeds only when exactly one global non-terminal Work Window exists; selected/default workspace fallback is forbidden."),
+        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission is supported only for stale connector compatibility and binds only to the workspace explicitly selected in this MCP session after open_workspace/open_current_workspace; default workspace fallback and cross-workspace inference are forbidden."),
         confirm: z.string().describe("Exact confirmation string: REBOOT_WINDOWS."),
         dry_run: z.boolean().optional().describe("Default: true. Validate and return the exact reboot plan without executing it.")
       },
@@ -1573,7 +1581,7 @@ export function createCodexProServer(
       title: "Start Dedicated Chrome",
       description: "Start the canonical AI Project Coordinator Chrome process only. Uses fixed executable C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe, fixed profile C:\\CoordinatorRuntime\\browser-profile, and loopback CDP 127.0.0.1:9223. Requires exact confirmation START_DEDICATED_CHROME_CDP. dry_run defaults to true. An already-healthy loopback CDP returns without launching a duplicate process; a fresh launch is attempted at most once and succeeds only after CDP readiness is confirmed. No arbitrary path/args, navigation, CDP commands, stop/restart/kill, or automatic retry are exposed.",
       inputSchema: {
-        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission exists only for backward compatibility and succeeds only when exactly one global non-terminal Work Window exists; selected/default workspace fallback is forbidden."),
+        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission is supported only for stale connector compatibility and binds only to the workspace explicitly selected in this MCP session after open_workspace/open_current_workspace; default workspace fallback and cross-workspace inference are forbidden."),
         confirm: z.string().describe(`Exact confirmation string: ${DEDICATED_CHROME_CONFIRM}.`),
         dry_run: z.boolean().optional().describe("Default: true. Validate and return the exact canonical Chrome start plan without launching Chrome.")
       },
@@ -1632,7 +1640,7 @@ export function createCodexProServer(
       title: "Windows Power Action",
       description: "Run the existing bounded Windows shutdown/reboot operator. Requires exact confirmation and an explicit dry_run boolean. Normal non-force dispatch is attempted first; only Windows error 1271 (machine locked) permits exactly one /f fallback.",
       inputSchema: {
-        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission exists only for backward compatibility and succeeds only when exactly one global non-terminal Work Window exists; selected/default workspace fallback is forbidden."),
+        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission is supported only for stale connector compatibility and binds only to the workspace explicitly selected in this MCP session after open_workspace/open_current_workspace; default workspace fallback and cross-workspace inference are forbidden."),
         action: z.enum(["shutdown", "reboot"]),
         confirm: z.string(),
         dry_run: z.boolean()
@@ -1657,7 +1665,7 @@ export function createCodexProServer(
       title: "Windows Desktop UI",
       description: "Run the existing bounded Windows desktop UI operator with an explicit dry_run boolean and the fixed Phase6 action schema.",
       inputSchema: {
-        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission exists only for backward compatibility and succeeds only when exactly one global non-terminal Work Window exists; selected/default workspace fallback is forbidden."),
+        workspace_id: z.string().min(1).optional().describe("Preferred explicit Work Window workspace binding. Omission is supported only for stale connector compatibility and binds only to the workspace explicitly selected in this MCP session after open_workspace/open_current_workspace; default workspace fallback and cross-workspace inference are forbidden."),
         actions: z.array(
           z.discriminatedUnion("type", [
             z.object({

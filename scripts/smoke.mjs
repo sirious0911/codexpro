@@ -2088,8 +2088,12 @@ await assertToolMode('minimal', ['codexpro', 'server_config', 'codexpro_self_tes
 await assertToolMode('', ['codexpro', 'server_config', 'show_changes', 'search'], ['inspect_workspace'], { CODEXPRO_ANALYSIS: '0' });
 
 const directBindingWorkspace = path.join(tmp, 'host-direct-binding-alt');
+const directOtherWorkspace1 = path.join(tmp, 'host-direct-binding-other-1');
+const directOtherWorkspace2 = path.join(tmp, 'host-direct-binding-other-2');
 const directBindingHome = path.join(tmp, 'host-direct-binding-home');
 await fs.mkdir(directBindingWorkspace, { recursive: true });
+await fs.mkdir(directOtherWorkspace1, { recursive: true });
+await fs.mkdir(directOtherWorkspace2, { recursive: true });
 await fs.mkdir(directBindingHome, { recursive: true });
 const directBindingClient = new McpStdioClient(
   'node',
@@ -2133,13 +2137,31 @@ const directActive = await directBindingClient.request('tools/call', {
   arguments: { root: directBindingWorkspace, include_tree: false }
 });
 const directActiveId = directActive.structuredContent.workspace_id;
-await directBindingClient.request('tools/call', {
-  name: 'open_workspace',
-  arguments: { root: tmp, include_tree: false }
-});
 const directActiveWindow = await directBindingClient.request('tools/call', {
   name: 'start_work_window',
-  arguments: { workspace_id: directActiveId, session_binding: 'host-direct-explicit-active' }
+  arguments: { workspace_id: directActiveId, session_binding: 'host-direct-selected-active' }
+});
+const directOther1 = await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: directOtherWorkspace1, include_tree: false }
+});
+const directOther1Id = directOther1.structuredContent.workspace_id;
+const directOther1Window = await directBindingClient.request('tools/call', {
+  name: 'start_work_window',
+  arguments: { workspace_id: directOther1Id, session_binding: 'host-direct-unrelated-1' }
+});
+const directOther2 = await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: directOtherWorkspace2, include_tree: false }
+});
+const directOther2Id = directOther2.structuredContent.workspace_id;
+const directOther2Window = await directBindingClient.request('tools/call', {
+  name: 'start_work_window',
+  arguments: { workspace_id: directOther2Id, session_binding: 'host-direct-unrelated-2' }
+});
+await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: directBindingWorkspace, include_tree: false }
 });
 
 const directBindingTools = await directBindingClient.request('tools/list', {});
@@ -2160,6 +2182,10 @@ for (const name of directBindingExact6) {
   if ((tool.inputSchema.required ?? []).includes('workspace_id')) {
     throw new Error(`${name} schema made workspace_id required: ${JSON.stringify(tool.inputSchema)}`);
   }
+  const workspaceDescription = tool.inputSchema.properties.workspace_id.description ?? '';
+  if (!/explicitly selected in this MCP session/i.test(workspaceDescription) || !/default workspace fallback/i.test(workspaceDescription)) {
+    throw new Error(`${name} schema does not describe strict session-selected fallback: ${JSON.stringify(tool.inputSchema)}`);
+  }
 }
 
 const directOnlyCases = [
@@ -2173,11 +2199,12 @@ const directOnlyCases = [
 for (const [name, baseArgs] of directOnlyCases) {
   const implicit = await directBindingClient.request('tools/call', { name, arguments: baseArgs });
   if (
-    /no global non-terminal Work Window|global Work Window binding is ambiguous|selected\/default workspace fallback|requires an explicit workspace_id/i.test(
+    implicit.structuredContent?.must_stop === true ||
+    /no strict selected workspace|strict selected workspace has no non-terminal|ambiguous within the selected workspace|default workspace fallback|cross-workspace inference/i.test(
       JSON.stringify(implicit)
     )
   ) {
-    throw new Error(`${name} did not backward-bind to the sole global ACTIVE workspace: ${JSON.stringify(implicit)}`);
+    throw new Error(`${name} did not backward-bind to the selected ACTIVE workspace while unrelated ACTIVE windows existed: ${JSON.stringify(implicit)}`);
   }
 
   const stale = await directBindingClient.request('tools/call', {
@@ -2219,6 +2246,56 @@ if (
   );
 }
 
+await directBindingClient.request('tools/call', {
+  name: 'open_current_workspace',
+  arguments: { include_tree: false }
+});
+const selectedStoppedWithActiveElsewhere = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  !selectedStoppedWithActiveElsewhere.isError ||
+  !/strict selected workspace has no non-terminal Work Window/i.test(JSON.stringify(selectedStoppedWithActiveElsewhere))
+) {
+  throw new Error(
+    `selected STOPPED workspace incorrectly rebound to ACTIVE elsewhere: ${JSON.stringify(selectedStoppedWithActiveElsewhere)}`
+  );
+}
+await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: directBindingWorkspace, include_tree: false }
+});
+
+const unselectedClient = new McpStdioClient(
+  'node',
+  ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--tool-mode', 'full'],
+  {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CODEXPRO_ROOT: tmp,
+      CODEXPRO_ALLOWED_ROOTS: tmp,
+      CODEXPRO_HOME: directBindingHome,
+      CODEXPRO_LOCAL_CAPABILITIES: 'full'
+    }
+  }
+);
+await unselectedClient.request('initialize', {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'codexpro-host-direct-unselected-smoke', version: '0.1.0' }
+});
+unselectedClient.notify('notifications/initialized');
+const unselectedImplicit = await unselectedClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (!unselectedImplicit.isError || !/no strict selected workspace/i.test(JSON.stringify(unselectedImplicit))) {
+  throw new Error(`unselected MCP session did not fail closed without default fallback: ${JSON.stringify(unselectedImplicit)}`);
+}
+unselectedClient.close();
+
 const shutdownExplicitActive = await directBindingClient.request('tools/call', {
   name: 'shutdown_windows',
   arguments: { workspace_id: directActiveId, confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
@@ -2254,6 +2331,84 @@ if (
   throw new Error(`ordinary source read unexpectedly bypassed Work Window gate: ${JSON.stringify(ordinaryStoppedRead)}`);
 }
 
+const selectedRecordPath = path.join(
+  directBindingHome,
+  'work-windows',
+  'windows',
+  `${directActiveWindow.structuredContent.work_window_id}.json`
+);
+const selectedRecordOriginal = JSON.parse(await fs.readFile(selectedRecordPath, 'utf8'));
+
+const duplicateSelectedId = '11111111-1111-4111-8111-111111111111';
+const duplicateSelectedPath = path.join(directBindingHome, 'work-windows', 'windows', `${duplicateSelectedId}.json`);
+await fs.writeFile(
+  duplicateSelectedPath,
+  JSON.stringify(
+    { ...selectedRecordOriginal, work_window_id: duplicateSelectedId, session_binding: 'host-direct-selected-duplicate' },
+    null,
+    2
+  ) + '\n',
+  'utf8'
+);
+const selectedMultiple = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  !selectedMultiple.isError ||
+  !/2 non-terminal Work Windows.*ambiguous within the selected workspace/i.test(JSON.stringify(selectedMultiple))
+) {
+  throw new Error(`selected workspace multiple candidates did not fail closed: ${JSON.stringify(selectedMultiple)}`);
+}
+await fs.rm(duplicateSelectedPath);
+
+await fs.writeFile(
+  selectedRecordPath,
+  JSON.stringify({ ...selectedRecordOriginal, workspace_root: path.resolve(directOtherWorkspace1) }, null, 2) + '\n',
+  'utf8'
+);
+const selectedCrossBindingTamper = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  !selectedCrossBindingTamper.isError ||
+  !/strict selected workspace has no non-terminal Work Window/i.test(JSON.stringify(selectedCrossBindingTamper))
+) {
+  throw new Error(`selected workspace id/root tamper did not fail closed: ${JSON.stringify(selectedCrossBindingTamper)}`);
+}
+await fs.writeFile(selectedRecordPath, JSON.stringify(selectedRecordOriginal, null, 2) + '\n', 'utf8');
+
+const drainingStartedAtMs = Date.now() - (27 * 60 * 1000 + 1_000);
+await fs.writeFile(
+  selectedRecordPath,
+  JSON.stringify(
+    {
+      ...selectedRecordOriginal,
+      started_at_ms: drainingStartedAtMs,
+      started_at: new Date(drainingStartedAtMs).toISOString(),
+      drain_at_ms: drainingStartedAtMs + 27 * 60 * 1000,
+      drain_at: new Date(drainingStartedAtMs + 27 * 60 * 1000).toISOString(),
+      deadline_ms: drainingStartedAtMs + 30 * 60 * 1000,
+      deadline: new Date(drainingStartedAtMs + 30 * 60 * 1000).toISOString()
+    },
+    null,
+    2
+  ) + '\n',
+  'utf8'
+);
+const selectedDraining = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  !selectedDraining.isError ||
+  selectedDraining.structuredContent?.must_stop !== true ||
+  selectedDraining.structuredContent?.work_window_state !== 'DRAINING'
+) {
+  throw new Error(`selected DRAINING workspace did not fail through continuation boundary: ${JSON.stringify(selectedDraining)}`);
+}
+
 await directBindingClient.request('tools/call', {
   name: 'stop_work_window',
   arguments: {
@@ -2261,91 +2416,18 @@ await directBindingClient.request('tools/call', {
     work_window_id: directActiveWindow.structuredContent.work_window_id
   }
 });
-
-const noGlobalWindow = await directBindingClient.request('tools/call', {
-  name: 'shutdown_windows',
-  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
-});
-if (!noGlobalWindow.isError || !/no global non-terminal Work Window/i.test(JSON.stringify(noGlobalWindow))) {
-  throw new Error(`missing workspace_id with zero global candidates did not fail closed: ${JSON.stringify(noGlobalWindow)}`);
-}
-
-const directActiveWindow2 = await directBindingClient.request('tools/call', {
-  name: 'start_work_window',
-  arguments: { workspace_id: directActiveId, session_binding: 'host-direct-global-active' }
-});
-const directBindingWorkspace2 = path.join(tmp, 'host-direct-binding-second');
-await fs.mkdir(directBindingWorkspace2, { recursive: true });
-const directSecond = await directBindingClient.request('tools/call', {
-  name: 'open_workspace',
-  arguments: { root: directBindingWorkspace2, include_tree: false }
-});
-const directSecondId = directSecond.structuredContent.workspace_id;
-const directSecondWindow = await directBindingClient.request('tools/call', {
-  name: 'start_work_window',
-  arguments: { workspace_id: directSecondId, session_binding: 'host-direct-global-second' }
-});
-
-const ambiguousTwoActive = await directBindingClient.request('tools/call', {
-  name: 'shutdown_windows',
-  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
-});
-if (!ambiguousTwoActive.isError || !/ambiguous across 2 non-terminal candidates/i.test(JSON.stringify(ambiguousTwoActive))) {
-  throw new Error(`two global ACTIVE candidates did not fail closed as ambiguous: ${JSON.stringify(ambiguousTwoActive)}`);
-}
-
-const secondRecordPath = path.join(
-  directBindingHome,
-  'work-windows',
-  'windows',
-  `${directSecondWindow.structuredContent.work_window_id}.json`
-);
-const secondRecord = JSON.parse(await fs.readFile(secondRecordPath, 'utf8'));
-const drainingStartedAtMs = Date.now() - (27 * 60 * 1000 + 1_000);
-secondRecord.started_at_ms = drainingStartedAtMs;
-secondRecord.started_at = new Date(drainingStartedAtMs).toISOString();
-secondRecord.drain_at_ms = drainingStartedAtMs + 27 * 60 * 1000;
-secondRecord.drain_at = new Date(secondRecord.drain_at_ms).toISOString();
-secondRecord.deadline_ms = drainingStartedAtMs + 30 * 60 * 1000;
-secondRecord.deadline = new Date(secondRecord.deadline_ms).toISOString();
-await fs.writeFile(secondRecordPath, JSON.stringify(secondRecord, null, 2) + '\n', 'utf8');
-
-const ambiguousActiveDraining = await directBindingClient.request('tools/call', {
-  name: 'shutdown_windows',
-  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
-});
-if (
-  !ambiguousActiveDraining.isError ||
-  !/ambiguous across 2 non-terminal candidates/i.test(JSON.stringify(ambiguousActiveDraining))
-) {
-  throw new Error(`ACTIVE + DRAINING global candidates did not fail closed as ambiguous: ${JSON.stringify(ambiguousActiveDraining)}`);
-}
-
 await directBindingClient.request('tools/call', {
   name: 'stop_work_window',
   arguments: {
-    workspace_id: directActiveId,
-    work_window_id: directActiveWindow2.structuredContent.work_window_id
+    workspace_id: directOther1Id,
+    work_window_id: directOther1Window.structuredContent.work_window_id
   }
 });
-
-const soleDraining = await directBindingClient.request('tools/call', {
-  name: 'shutdown_windows',
-  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
-});
-if (
-  !soleDraining.isError ||
-  soleDraining.structuredContent?.must_stop !== true ||
-  soleDraining.structuredContent?.work_window_state !== 'DRAINING'
-) {
-  throw new Error(`sole global DRAINING candidate did not fail through continuation boundary: ${JSON.stringify(soleDraining)}`);
-}
-
 await directBindingClient.request('tools/call', {
   name: 'stop_work_window',
   arguments: {
-    workspace_id: directSecondId,
-    work_window_id: directSecondWindow.structuredContent.work_window_id
+    workspace_id: directOther2Id,
+    work_window_id: directOther2Window.structuredContent.work_window_id
   }
 });
 directBindingClient.close();
