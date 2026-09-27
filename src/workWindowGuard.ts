@@ -718,6 +718,48 @@ export class WorkWindowGuard {
     );
   }
 
+  async listGlobalNonTerminal(): Promise<WorkWindowStatus[]> {
+    await this.initialize();
+    const host = await this.readExistingHost();
+    if (!host) return [];
+    const recordNames = await this.registryRecordNames();
+    if (recordNames.length > MAX_WINDOW_RECORDS) {
+      throw new WorkWindowError(`Work Window registry exceeds bounded limit of ${MAX_WINDOW_RECORDS} records.`);
+    }
+
+    const statuses: WorkWindowStatus[] = [];
+    for (const name of recordNames) {
+      const id = assertUuid(name.slice(0, -5), "work_window_id");
+      const pathname = path.join(this.windowsDir, name);
+      const raw = await readJson(pathname);
+      if (raw === undefined) continue;
+      let record = validateWindowRecord(raw, pathname);
+      if (record.work_window_id !== id) {
+        throw new WorkWindowError(`Work Window filename/id mismatch: ${name}`);
+      }
+      if (record.host_id !== host.host_id) {
+        throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+      }
+      if (record.stopped_at_ms === undefined && this.now() >= record.deadline_ms) {
+        await this.terminalizeDeadline(record.work_window_id);
+        const reconciled = await readJson(pathname);
+        if (reconciled === undefined) continue;
+        record = validateWindowRecord(reconciled, pathname);
+        if (record.work_window_id !== id) {
+          throw new WorkWindowError(`Work Window filename/id mismatch: ${name}`);
+        }
+        if (record.host_id !== host.host_id) {
+          throw new WorkWindowError(`Work Window host_id mismatch: ${record.work_window_id}`);
+        }
+      }
+      const status = this.statusFrom(record);
+      if (status.state === "ACTIVE" || status.state === "DRAINING") statuses.push(status);
+    }
+    return statuses.sort(
+      (a, b) => a.started_at.localeCompare(b.started_at) || a.work_window_id.localeCompare(b.work_window_id)
+    );
+  }
+
   async latestStatus(workspace: Workspace): Promise<WorkWindowStatus | undefined> {
     const records = await this.workspaceRecords(workspace);
     const latest = records.at(-1);

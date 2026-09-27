@@ -185,6 +185,14 @@ try {
   const cross = await guard.start(workspaceB);
   assert.equal((await guard.listActive(workspaceB)).some((item) => item.work_window_id === cross.work_window_id), true);
   assert.equal((await guard.listActive(workspaceA)).some((item) => item.work_window_id === cross.work_window_id), false);
+  const globalNonTerminal = await guard.listGlobalNonTerminal();
+  assert.deepEqual(
+    globalNonTerminal.map((item) => item.work_window_id),
+    [concurrentWinner, cross]
+      .sort((a, b) => a.started_at.localeCompare(b.started_at) || a.work_window_id.localeCompare(b.work_window_id))
+      .map((item) => item.work_window_id)
+  );
+  assert(globalNonTerminal.every((item) => item.state === 'ACTIVE'));
 
   // H. Exact deadline is terminal; reconciliation durably auto-stops and checkpoint remains writable afterward.
   const winnerStart = Date.parse(concurrentWinner.started_at);
@@ -196,6 +204,10 @@ try {
   assert.equal(autoStopped.state, 'STOPPED');
   assert.equal(autoStopped.stop_reason, 'DEADLINE_AUTO');
   assert.equal(autoStopped.stopped_at, concurrentWinner.deadline);
+  assert.deepEqual(await guard.listGlobalNonTerminal(), []);
+  const crossAutoStopped = await guard.status(workspaceB, cross.work_window_id);
+  assert.equal(crossAutoStopped.state, 'STOPPED');
+  assert.equal(crossAutoStopped.stop_reason, 'DEADLINE_AUTO');
   const expiredCheckpoint = await guard.checkpoint(workspaceA, concurrentWinner.work_window_id, {
     completed: ['active work'],
     pending: ['next user turn'],

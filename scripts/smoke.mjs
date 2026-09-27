@@ -2142,6 +2142,26 @@ const directActiveWindow = await directBindingClient.request('tools/call', {
   arguments: { workspace_id: directActiveId, session_binding: 'host-direct-explicit-active' }
 });
 
+const directBindingTools = await directBindingClient.request('tools/list', {});
+const directBindingExact6 = [
+  'codexpro_controlled_handover',
+  'shutdown_windows',
+  'reboot_windows',
+  'start_dedicated_chrome',
+  'windows_power_action',
+  'windows_desktop_ui'
+];
+for (const name of directBindingExact6) {
+  const tool = directBindingTools.tools.find((item) => item.name === name);
+  if (!tool) throw new Error(`missing direct-binding tool schema: ${name}`);
+  if (!tool.inputSchema?.properties?.workspace_id) {
+    throw new Error(`${name} schema does not expose workspace_id: ${JSON.stringify(tool.inputSchema)}`);
+  }
+  if ((tool.inputSchema.required ?? []).includes('workspace_id')) {
+    throw new Error(`${name} schema made workspace_id required: ${JSON.stringify(tool.inputSchema)}`);
+  }
+}
+
 const directOnlyCases = [
   ['codexpro_controlled_handover', { confirm: 'CODEXPRO_CONTROLLED_HANDOVER', dry_run: true }],
   ['shutdown_windows', { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }],
@@ -2151,9 +2171,13 @@ const directOnlyCases = [
   ['windows_desktop_ui', { actions: [{ type: 'POINTER_MOVE', x: 0, y: 0 }], dry_run: true }]
 ];
 for (const [name, baseArgs] of directOnlyCases) {
-  const missing = await directBindingClient.request('tools/call', { name, arguments: baseArgs });
-  if (!missing.isError || !/workspace_id|invalid arguments/i.test(JSON.stringify(missing))) {
-    throw new Error(`${name} missing explicit workspace binding did not fail closed: ${JSON.stringify(missing)}`);
+  const implicit = await directBindingClient.request('tools/call', { name, arguments: baseArgs });
+  if (
+    /no global non-terminal Work Window|global Work Window binding is ambiguous|selected\/default workspace fallback|requires an explicit workspace_id/i.test(
+      JSON.stringify(implicit)
+    )
+  ) {
+    throw new Error(`${name} did not backward-bind to the sole global ACTIVE workspace: ${JSON.stringify(implicit)}`);
   }
 
   const stale = await directBindingClient.request('tools/call', {
@@ -2178,6 +2202,21 @@ for (const [name, baseArgs] of directOnlyCases) {
   ) {
     throw new Error(`${name} did not use its explicit ACTIVE workspace binding: ${JSON.stringify(active)}`);
   }
+}
+
+const shutdownImplicitActive = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  shutdownImplicitActive.isError ||
+  shutdownImplicitActive.structuredContent?.status !== 'DRY_RUN' ||
+  shutdownImplicitActive.structuredContent?.dispatchAttempts !== 0 ||
+  shutdownImplicitActive.structuredContent?.lockedForceFallbackUsed !== false
+) {
+  throw new Error(
+    `shutdown old-contract dry-run did not bind sole global ACTIVE workspace safely: ${JSON.stringify(shutdownImplicitActive)}`
+  );
 }
 
 const shutdownExplicitActive = await directBindingClient.request('tools/call', {
@@ -2220,6 +2259,93 @@ await directBindingClient.request('tools/call', {
   arguments: {
     workspace_id: directActiveId,
     work_window_id: directActiveWindow.structuredContent.work_window_id
+  }
+});
+
+const noGlobalWindow = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (!noGlobalWindow.isError || !/no global non-terminal Work Window/i.test(JSON.stringify(noGlobalWindow))) {
+  throw new Error(`missing workspace_id with zero global candidates did not fail closed: ${JSON.stringify(noGlobalWindow)}`);
+}
+
+const directActiveWindow2 = await directBindingClient.request('tools/call', {
+  name: 'start_work_window',
+  arguments: { workspace_id: directActiveId, session_binding: 'host-direct-global-active' }
+});
+const directBindingWorkspace2 = path.join(tmp, 'host-direct-binding-second');
+await fs.mkdir(directBindingWorkspace2, { recursive: true });
+const directSecond = await directBindingClient.request('tools/call', {
+  name: 'open_workspace',
+  arguments: { root: directBindingWorkspace2, include_tree: false }
+});
+const directSecondId = directSecond.structuredContent.workspace_id;
+const directSecondWindow = await directBindingClient.request('tools/call', {
+  name: 'start_work_window',
+  arguments: { workspace_id: directSecondId, session_binding: 'host-direct-global-second' }
+});
+
+const ambiguousTwoActive = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (!ambiguousTwoActive.isError || !/ambiguous across 2 non-terminal candidates/i.test(JSON.stringify(ambiguousTwoActive))) {
+  throw new Error(`two global ACTIVE candidates did not fail closed as ambiguous: ${JSON.stringify(ambiguousTwoActive)}`);
+}
+
+const secondRecordPath = path.join(
+  directBindingHome,
+  'work-windows',
+  'windows',
+  `${directSecondWindow.structuredContent.work_window_id}.json`
+);
+const secondRecord = JSON.parse(await fs.readFile(secondRecordPath, 'utf8'));
+const drainingStartedAtMs = Date.now() - (27 * 60 * 1000 + 1_000);
+secondRecord.started_at_ms = drainingStartedAtMs;
+secondRecord.started_at = new Date(drainingStartedAtMs).toISOString();
+secondRecord.drain_at_ms = drainingStartedAtMs + 27 * 60 * 1000;
+secondRecord.drain_at = new Date(secondRecord.drain_at_ms).toISOString();
+secondRecord.deadline_ms = drainingStartedAtMs + 30 * 60 * 1000;
+secondRecord.deadline = new Date(secondRecord.deadline_ms).toISOString();
+await fs.writeFile(secondRecordPath, JSON.stringify(secondRecord, null, 2) + '\n', 'utf8');
+
+const ambiguousActiveDraining = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  !ambiguousActiveDraining.isError ||
+  !/ambiguous across 2 non-terminal candidates/i.test(JSON.stringify(ambiguousActiveDraining))
+) {
+  throw new Error(`ACTIVE + DRAINING global candidates did not fail closed as ambiguous: ${JSON.stringify(ambiguousActiveDraining)}`);
+}
+
+await directBindingClient.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: directActiveId,
+    work_window_id: directActiveWindow2.structuredContent.work_window_id
+  }
+});
+
+const soleDraining = await directBindingClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: 'SHUTDOWN_WINDOWS', dry_run: true }
+});
+if (
+  !soleDraining.isError ||
+  soleDraining.structuredContent?.must_stop !== true ||
+  soleDraining.structuredContent?.work_window_state !== 'DRAINING'
+) {
+  throw new Error(`sole global DRAINING candidate did not fail through continuation boundary: ${JSON.stringify(soleDraining)}`);
+}
+
+await directBindingClient.request('tools/call', {
+  name: 'stop_work_window',
+  arguments: {
+    workspace_id: directSecondId,
+    work_window_id: directSecondWindow.structuredContent.work_window_id
   }
 });
 directBindingClient.close();
