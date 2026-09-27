@@ -2269,7 +2269,7 @@ await directBindingClient.request('tools/call', {
 
 const unselectedClient = new McpStdioClient(
   'node',
-  ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--tool-mode', 'full'],
+  ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', directBindingWorkspace, '--tool-mode', 'full'],
   {
     cwd: path.resolve('.'),
     env: {
@@ -2294,7 +2294,130 @@ const unselectedImplicit = await unselectedClient.request('tools/call', {
 if (!unselectedImplicit.isError || !/no strict selected workspace/i.test(JSON.stringify(unselectedImplicit))) {
   throw new Error(`unselected MCP session did not fail closed without default fallback: ${JSON.stringify(unselectedImplicit)}`);
 }
-unselectedClient.close();
+const boundExact5Cases = [
+  [
+    'codexpro_controlled_handover',
+    { confirm: `CODEXPRO_CONTROLLED_HANDOVER::workspace=${directActiveId}`, dry_run: true },
+    (result) =>
+      result.structuredContent?.status === 'DRY_RUN' &&
+      result.structuredContent?.requestId == null &&
+      result.structuredContent?.requestedAt == null
+  ],
+  [
+    'shutdown_windows',
+    { confirm: `SHUTDOWN_WINDOWS::workspace=${directActiveId}`, dry_run: true },
+    (result) =>
+      result.structuredContent?.status === 'DRY_RUN' &&
+      result.structuredContent?.dispatchAttempts === 0 &&
+      result.structuredContent?.lockedForceFallbackUsed === false
+  ],
+  [
+    'reboot_windows',
+    { confirm: `REBOOT_WINDOWS::workspace=${directActiveId}`, dry_run: true },
+    (result) =>
+      result.structuredContent?.status === 'DRY_RUN' &&
+      result.structuredContent?.dispatchAttempts === 0 &&
+      result.structuredContent?.lockedForceFallbackUsed === false
+  ],
+  [
+    'start_dedicated_chrome',
+    { confirm: `START_DEDICATED_CHROME_CDP::workspace=${directActiveId}`, dry_run: true },
+    (result) =>
+      result.structuredContent?.status === 'DRY_RUN' &&
+      result.structuredContent?.launchAttempted === false &&
+      result.structuredContent?.launchCount === 0
+  ],
+  [
+    'windows_power_action',
+    { action: 'shutdown', confirm: `SHUTDOWN_WINDOWS::workspace=${directActiveId}`, dry_run: true },
+    (result) =>
+      result.structuredContent?.status === 'DRY_RUN' &&
+      result.structuredContent?.dispatch_attempts === 0 &&
+      result.structuredContent?.locked_force_fallback_used === false
+  ],
+  [
+    'windows_power_action',
+    { action: 'reboot', confirm: `REBOOT_WINDOWS::workspace=${directActiveId}`, dry_run: true },
+    (result) =>
+      result.structuredContent?.status === 'DRY_RUN' &&
+      result.structuredContent?.dispatch_attempts === 0 &&
+      result.structuredContent?.locked_force_fallback_used === false
+  ]
+];
+for (const [name, args, validate] of boundExact5Cases) {
+  const result = await unselectedClient.request('tools/call', { name, arguments: args });
+  if (result.isError || !validate(result)) {
+    throw new Error(`${name} bound-confirm dry-run failed without session selection: ${JSON.stringify(result)}`);
+  }
+}
+
+const boundStopped = await unselectedClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: `SHUTDOWN_WINDOWS::workspace=${directDefaultId}`, dry_run: true }
+});
+if (
+  !boundStopped.isError ||
+  boundStopped.structuredContent?.must_stop !== true ||
+  boundStopped.structuredContent?.work_window_state !== 'STOPPED'
+) {
+  throw new Error(`bound confirm to STOPPED workspace did not fail closed: ${JSON.stringify(boundStopped)}`);
+}
+
+const unknownBoundId = 'ws_000000000000000000000000';
+const boundUnknown = await unselectedClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: `SHUTDOWN_WINDOWS::workspace=${unknownBoundId}`, dry_run: true }
+});
+if (!boundUnknown.isError || !/Unknown workspace_id/i.test(JSON.stringify(boundUnknown))) {
+  throw new Error(`bound confirm to unknown workspace did not fail closed: ${JSON.stringify(boundUnknown)}`);
+}
+
+for (const malformedConfirm of [
+  'SHUTDOWN_WINDOWS::workspace=',
+  'SHUTDOWN_WINDOWS::workspace=ws_ABCDEF000000000000000000',
+  `SHUTDOWN_WINDOWS::workspace=${directActiveId}::extra`,
+  `REBOOT_WINDOWS::workspace=${directActiveId}`
+]) {
+  const malformed = await unselectedClient.request('tools/call', {
+    name: 'shutdown_windows',
+    arguments: { confirm: malformedConfirm, dry_run: true }
+  });
+  if (!malformed.isError || !/malformed confirmation-carried|invalid confirmation-carried/i.test(JSON.stringify(malformed))) {
+    throw new Error(`malformed bound confirmation did not fail closed: ${JSON.stringify(malformed)}`);
+  }
+}
+
+const explicitAndSuffixed = await unselectedClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: {
+    workspace_id: directActiveId,
+    confirm: `SHUTDOWN_WINDOWS::workspace=${directActiveId}`,
+    dry_run: true
+  }
+});
+if (!explicitAndSuffixed.isError || !/confirmation/i.test(JSON.stringify(explicitAndSuffixed))) {
+  throw new Error(`explicit workspace_id + suffixed confirm did not fail closed: ${JSON.stringify(explicitAndSuffixed)}`);
+}
+
+const staleDesktopNoSelection = await unselectedClient.request('tools/call', {
+  name: 'windows_desktop_ui',
+  arguments: { actions: [{ type: 'POINTER_MOVE', x: 0, y: 0 }], dry_run: true }
+});
+if (!staleDesktopNoSelection.isError || !/no strict selected workspace/i.test(JSON.stringify(staleDesktopNoSelection))) {
+  throw new Error(`windows_desktop_ui stale-schema no-selection did not remain fail-closed: ${JSON.stringify(staleDesktopNoSelection)}`);
+}
+
+const explicitDesktopActive = await unselectedClient.request('tools/call', {
+  name: 'windows_desktop_ui',
+  arguments: {
+    workspace_id: directActiveId,
+    actions: [{ type: 'POINTER_MOVE', x: 0, y: 0 }],
+    dry_run: true
+  }
+});
+if (explicitDesktopActive.isError || explicitDesktopActive.structuredContent?.must_stop === true) {
+  throw new Error(`windows_desktop_ui explicit ACTIVE workspace dry-run regressed: ${JSON.stringify(explicitDesktopActive)}`);
+}
 
 const shutdownExplicitActive = await directBindingClient.request('tools/call', {
   name: 'shutdown_windows',
@@ -2408,6 +2531,19 @@ if (
 ) {
   throw new Error(`selected DRAINING workspace did not fail through continuation boundary: ${JSON.stringify(selectedDraining)}`);
 }
+
+const boundDraining = await unselectedClient.request('tools/call', {
+  name: 'shutdown_windows',
+  arguments: { confirm: `SHUTDOWN_WINDOWS::workspace=${directActiveId}`, dry_run: true }
+});
+if (
+  !boundDraining.isError ||
+  boundDraining.structuredContent?.must_stop !== true ||
+  boundDraining.structuredContent?.work_window_state !== 'DRAINING'
+) {
+  throw new Error(`bound confirm to DRAINING workspace did not fail closed: ${JSON.stringify(boundDraining)}`);
+}
+unselectedClient.close();
 
 await directBindingClient.request('tools/call', {
   name: 'stop_work_window',

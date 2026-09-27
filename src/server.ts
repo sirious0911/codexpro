@@ -499,6 +499,53 @@ const WORK_WINDOW_EXPLICIT_WORKSPACE_BINDING_TOOL_NAMES = new Set<string>([
   "windows_desktop_ui"
 ]);
 
+const WORK_WINDOW_CONFIRM_CARRIED_BINDING_TOOL_NAMES = new Set<string>([
+  CODEXPRO_CONTROLLED_HANDOVER_TOOL_NAME,
+  "shutdown_windows",
+  "reboot_windows",
+  "start_dedicated_chrome",
+  "windows_power_action"
+]);
+const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/;
+
+function hostToolBaseConfirmation(name: string, args: any): string | undefined {
+  if (name === CODEXPRO_CONTROLLED_HANDOVER_TOOL_NAME) return "CODEXPRO_CONTROLLED_HANDOVER";
+  if (name === "shutdown_windows") return "SHUTDOWN_WINDOWS";
+  if (name === "reboot_windows") return "REBOOT_WINDOWS";
+  if (name === "start_dedicated_chrome") return DEDICATED_CHROME_CONFIRM;
+  if (name === "windows_power_action") {
+    if (args?.action === "shutdown") return "SHUTDOWN_WINDOWS";
+    if (args?.action === "reboot") return "REBOOT_WINDOWS";
+  }
+  return undefined;
+}
+
+function parseConfirmCarriedWorkspaceBinding(
+  name: string,
+  args: any
+): { workspaceId: string; baseConfirmation: string } | undefined {
+  if (!WORK_WINDOW_CONFIRM_CARRIED_BINDING_TOOL_NAMES.has(name)) return undefined;
+  if (typeof args?.workspace_id === "string" && args.workspace_id.trim()) return undefined;
+  const baseConfirmation = hostToolBaseConfirmation(name, args);
+  if (!baseConfirmation) return undefined;
+  const confirm = typeof args?.confirm === "string" ? args.confirm : "";
+  const marker = "::workspace=";
+  if (!confirm.includes(marker)) return undefined;
+  const prefix = `${baseConfirmation}${marker}`;
+  if (!confirm.startsWith(prefix)) {
+    throw new CodexProError(
+      `${name} has a malformed confirmation-carried workspace binding; expected ${baseConfirmation}::workspace=<workspace_id>.`
+    );
+  }
+  const workspaceId = confirm.slice(prefix.length);
+  if (!WORKSPACE_ID_PATTERN.test(workspaceId)) {
+    throw new CodexProError(
+      `${name} has an invalid confirmation-carried workspace_id; expected canonical ws_<24 lowercase hex> format.`
+    );
+  }
+  return { workspaceId, baseConfirmation };
+}
+
 const registeredToolHandlersByServer = new WeakMap<object, Map<string, CodexToolHandler>>();
 
 function rememberRegisteredToolHandler(server: McpServer, name: string, handler: CodexToolHandler): void {
@@ -1298,7 +1345,11 @@ export function createCodexProServer(
     before: async (name, args) => {
       if (WORK_WINDOW_GATE_EXEMPT_TOOL_NAMES.has(name)) return undefined;
       const hostBoundTool = WORK_WINDOW_EXPLICIT_WORKSPACE_BINDING_TOOL_NAMES.has(name);
-      const workspaceId = typeof args?.workspace_id === "string" ? args.workspace_id.trim() : "";
+      const explicitWorkspaceId = typeof args?.workspace_id === "string" ? args.workspace_id.trim() : "";
+      const carriedBinding =
+        hostBoundTool && !explicitWorkspaceId ? parseConfirmCarriedWorkspaceBinding(name, args) : undefined;
+      const workspaceId = explicitWorkspaceId || carriedBinding?.workspaceId || "";
+      if (carriedBinding) args.confirm = carriedBinding.baseConfirmation;
       let workspace: Workspace;
       if (hostBoundTool && !workspaceId) {
         const selected = workspaces.getSelectedWorkspaceStrict();
