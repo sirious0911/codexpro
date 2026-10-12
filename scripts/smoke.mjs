@@ -164,7 +164,7 @@ function assertTerminalReportContract(started, expectedClientCapabilityKeys) {
 async function startClientWorkWindow(targetClient, workspaceId, expectedClientCapabilityKeys = []) {
   const started = await targetClient.request('tools/call', {
     name: 'start_work_window',
-    arguments: { ...(workspaceId ? { workspace_id: workspaceId } : {}), session_binding: 'smoke-client' }
+    arguments: { ...(workspaceId ? { workspace_id: workspaceId } : {}) }
   });
   if (started.isError || started.structuredContent?.state !== 'ACTIVE') {
     throw new Error(`start_work_window failed: ${JSON.stringify(started)}`);
@@ -377,6 +377,8 @@ const initialized = await client.request('initialize', {
 });
 if (
   !initialized.instructions?.includes('Every successful start_work_window returns work_window_user_notice generated only from that Work Window\'s started_at_kst and deadline_kst') ||
+  !initialized.instructions?.includes('make start_work_window a standalone tool call and pass workspace_id only; omit optional session_binding') ||
+  !initialized.instructions?.includes('session_binding is legacy diagnostic metadata and is not Work Window authority') ||
   !initialized.instructions?.includes('Copy that notice verbatim into the user-facing assistant response exactly once') ||
   !initialized.instructions?.includes('do not calculate, infer, or reformat the times yourself') ||
   !initialized.instructions?.includes('Never repeat a start notice from work_window_status, list_active_work_windows, checkpoint_work_window, or stop_work_window') ||
@@ -401,6 +403,14 @@ const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
 if (toolsByName.get('bash')?.inputSchema?.properties?.timeout_ms?.maximum !== 900000) {
   throw new Error(`bash schema did not expose the stable 15-minute ceiling: ${JSON.stringify(toolsByName.get('bash')?.inputSchema)}`);
+}
+const startWorkWindowTool = toolsByName.get('start_work_window');
+if (
+  !startWorkWindowTool?.description?.includes('standalone tool with workspace_id only and omit session_binding') ||
+  !startWorkWindowTool?.inputSchema?.properties?.session_binding?.description?.includes('Legacy diagnostic-only caller label') ||
+  !startWorkWindowTool?.inputSchema?.properties?.session_binding?.description?.includes('Hosted ChatGPT connector calls should omit this field')
+) {
+  throw new Error(`start_work_window hosted-call contract regressed: ${JSON.stringify(startWorkWindowTool)}`);
 }
 function hasWidgetMeta(name) {
   const meta = toolsByName.get(name)?._meta ?? {};
